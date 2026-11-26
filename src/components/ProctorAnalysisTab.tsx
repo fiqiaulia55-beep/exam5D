@@ -368,11 +368,14 @@ export function ProctorAnalysisTab({
         throw new Error('File CSV kosong atau format kolom tidak terbaca.');
       }
 
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
       const res = await fetch(`/api/exams/${selectedExam.id}/results/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           currentPin: authenticatedPin,
+          idToken: idToken || undefined,
+          examSnapshot: selectedExam,
           rows: parsed.rows,
           answerKey: effectiveKey.length > 0 ? effectiveKey : undefined,
           source: 'csv',
@@ -441,11 +444,13 @@ export function ProctorAnalysisTab({
     if (!manualName.trim() || !manualAbsen.trim()) return;
     setImportMessage(null);
     try {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
       const res = await fetch(`/api/exams/${selectedExam.id}/results/upsert`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           currentPin: authenticatedPin,
+          idToken: idToken || undefined,
           studentName: manualName.trim(),
           absenNumber: manualAbsen.trim(),
           rawScore: Number(manualRawScore) || 0,
@@ -484,11 +489,13 @@ export function ProctorAnalysisTab({
   };
 
   const handleDeleteResult = async (resultId?: string) => {
+    const idToken = await auth.currentUser?.getIdToken().catch(() => '');
     const res = await fetch(`/api/exams/${selectedExam.id}/results/delete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         currentPin: authenticatedPin,
+        idToken: idToken || undefined,
         resultId: resultId || null,
       }),
     });

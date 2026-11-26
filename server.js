@@ -1,9 +1,14 @@
 // server.ts
+import express2 from "express";
+import path2 from "path";
+
+// server/app.ts
 import express from "express";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import { fileURLToPath } from "url";
 
 // src/utils/formUrl.ts
 function normalizeGoogleFormUrl(rawUrl) {
@@ -67,19 +72,54 @@ function calculateFinalScore(rawScore, maxRawScore = 40) {
   return Math.round(score * 100) / 100;
 }
 
-// server.ts
+// server/app.ts
 dotenv.config();
-var PORT = Number(process.env.PORT) || 3e3;
-var DATA_DIR = path.resolve(process.cwd(), "data");
+var __filename = fileURLToPath(import.meta.url);
+var __dirname = path.dirname(__filename);
+var IS_VERCEL = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+var DATA_DIR = IS_VERCEL ? path.join("/tmp", "portal-cbt-5d") : path.resolve(process.cwd(), "data");
 var STATE_FILE = path.join(DATA_DIR, "portal-state.json");
+var KV_URL = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").replace(
+  /\/+$/,
+  ""
+);
+var KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
+var KV_STATE_KEY = process.env.PORTAL_KV_KEY || "portal_cbt_5d_state_v1";
+function loadFirebaseConfig() {
+  const candidates = [
+    path.resolve(process.cwd(), "firebase-applet-config.json"),
+    path.resolve(__dirname, "../firebase-applet-config.json")
+  ];
+  for (const cfgPath of candidates) {
+    try {
+      if (fs.existsSync(cfgPath)) {
+        return JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+      }
+    } catch {
+    }
+  }
+  return {
+    apiKey: process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY,
+    projectId: process.env.FIREBASE_PROJECT_ID
+  };
+}
+var SIGNING_SECRET = (() => {
+  const explicit = process.env.PORTAL_SIGNING_SECRET || process.env.KV_REST_API_TOKEN || "";
+  if (explicit) return explicit;
+  const cfg = loadFirebaseConfig();
+  return crypto.createHash("sha256").update(`portal-cbt-5d:${cfg.projectId || "local"}:${cfg.apiKey || "dev"}`).digest("hex");
+})();
 var DEFAULT_SETTINGS = {
   className: "Kelas 5D",
   defaultTeacherName: "Guru Kelas 5D",
   proctorPin: "5555"
 };
 function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch {
   }
 }
 function normalizeExamRecord(raw) {
@@ -108,34 +148,97 @@ function normalizeExamRecord(raw) {
     updatedAt: raw.updatedAt || (/* @__PURE__ */ new Date()).toISOString()
   };
 }
-function loadState() {
+function normalizeParsedState(parsed) {
+  return {
+    settings: { ...DEFAULT_SETTINGS, ...parsed.settings || {} },
+    exams: Array.isArray(parsed.exams) ? parsed.exams.map(normalizeExamRecord) : [],
+    sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+    results: Array.isArray(parsed.results) ? parsed.results : []
+  };
+}
+function loadStateFromDisk() {
   ensureDataDir();
-  if (fs.existsSync(STATE_FILE)) {
-    try {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
       const raw = fs.readFileSync(STATE_FILE, "utf-8");
       const parsed = JSON.parse(raw);
-      return {
-        settings: { ...DEFAULT_SETTINGS, ...parsed.settings || {} },
-        exams: Array.isArray(parsed.exams) ? parsed.exams.map(normalizeExamRecord) : [],
-        sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
-        results: Array.isArray(parsed.results) ? parsed.results : []
-      };
-    } catch {
-      return { settings: { ...DEFAULT_SETTINGS }, exams: [], sessions: [], results: [] };
+      return normalizeParsedState(parsed);
     }
+  } catch {
   }
   return { settings: { ...DEFAULT_SETTINGS }, exams: [], sessions: [], results: [] };
 }
-var state = loadState();
-function saveState() {
+var state = loadStateFromDisk();
+var lastKvSyncMs = 0;
+async function syncStateFromKv(force = false) {
+  if (!KV_URL || !KV_TOKEN) return;
+  const now = Date.now();
+  if (!force && now - lastKvSyncMs < 1e3) return;
+  try {
+    const res = await fetch(`${KV_URL}/get/${encodeURIComponent(KV_STATE_KEY)}`, {
+      headers: { Authorization: `Bearer ${KV_TOKEN}` }
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.result) {
+      const parsed = JSON.parse(data.result);
+      state = normalizeParsedState(parsed);
+    }
+    lastKvSyncMs = Date.now();
+  } catch {
+  }
+}
+async function saveState() {
   ensureDataDir();
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+  const serialized = JSON.stringify(state, null, 2);
+  try {
+    fs.writeFileSync(STATE_FILE, serialized, "utf-8");
+  } catch {
+  }
+  if (KV_URL && KV_TOKEN) {
+    try {
+      await fetch(`${KV_URL}/set/${encodeURIComponent(KV_STATE_KEY)}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${KV_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(serialized)
+      });
+      lastKvSyncMs = Date.now();
+    } catch {
+    }
+  }
 }
 function safeEqual(a, b) {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+function signSessionEnvelope(envelope) {
+  const payload = Buffer.from(JSON.stringify(envelope), "utf-8").toString("base64url");
+  const sig = crypto.createHmac("sha256", SIGNING_SECRET).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+function verifySessionToken(token) {
+  if (!token || typeof token !== "string") return null;
+  const dotIdx = token.indexOf(".");
+  if (dotIdx <= 0) return null;
+  const payload = token.slice(0, dotIdx);
+  const sig = token.slice(dotIdx + 1);
+  if (!payload || !sig) return null;
+  const expectedSig = crypto.createHmac("sha256", SIGNING_SECRET).update(payload).digest("base64url");
+  if (!safeEqual(sig, expectedSig)) return null;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf-8")
+    );
+    if (!parsed?.session?.id || !parsed?.session?.examId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 function computeExamStatus(exam, now) {
   if (!exam.googleFormUrl.trim()) {
@@ -175,6 +278,48 @@ function toPublicExam(exam, now) {
     hasFormUrl: Boolean(exam.googleFormUrl.trim()),
     computedStatus: computeExamStatus(exam, now),
     updatedAt: exam.updatedAt
+  };
+}
+function buildActiveSessionResponse(session, exam, now, fallbackEnvelope) {
+  const submitUnlocked = now >= session.unlockAt;
+  const googleFormUrl = exam?.googleFormUrl || fallbackEnvelope?.googleFormUrl || "";
+  const enableSubmitToken = exam?.enableSubmitToken ?? fallbackEnvelope?.enableSubmitToken ?? false;
+  const rawSubmitToken = exam?.submitToken || fallbackEnvelope?.submitToken || "KIRIM5D";
+  const maxViolations = exam?.maxViolationsBeforeLock ?? fallbackEnvelope?.maxViolationsBeforeLock ?? 3;
+  const examPublic = exam ? toPublicExam(exam, now) : fallbackEnvelope?.examPublic || {
+    id: session.examId,
+    examTitle: session.examTitle,
+    subject: session.subject,
+    className: state.settings.className,
+    teacherName: state.settings.defaultTeacherName,
+    durationMinutes: 60,
+    lockSubmitMinutes: 60,
+    enableSubmitToken,
+    enableBottomOverlayGuard: false,
+    maxViolationsBeforeLock: maxViolations,
+    availabilityMode: "manual_open",
+    scheduledStart: "",
+    scheduledEnd: "",
+    hasFormUrl: Boolean(googleFormUrl),
+    computedStatus: "open",
+    updatedAt: new Date(session.startedAt).toISOString()
+  };
+  const sessionToken = signSessionEnvelope({
+    session,
+    googleFormUrl,
+    submitToken: rawSubmitToken,
+    enableSubmitToken,
+    maxViolationsBeforeLock: maxViolations,
+    examPublic
+  });
+  return {
+    session,
+    googleFormUrl,
+    submitUnlocked,
+    submitToken: submitUnlocked && enableSubmitToken ? rawSubmitToken : null,
+    serverTime: now,
+    exam: examPublic,
+    sessionToken
   };
 }
 function upsertStudentResult(exam, payload) {
@@ -225,6 +370,10 @@ function upsertStudentResult(exam, payload) {
 function createApp() {
   const app = express();
   app.use(express.json({ limit: "4mb" }));
+  app.use("/api", async (_req, _res, next) => {
+    await syncStateFromKv(false);
+    next();
+  });
   app.get("/api/exam/public", (_req, res) => {
     const now = Date.now();
     const sortedExams = state.exams.slice().sort((a, b) => {
@@ -276,11 +425,7 @@ function createApp() {
     });
   });
   async function verifyTeacherIdToken(idToken) {
-    const cfgPath = path.resolve(process.cwd(), "firebase-applet-config.json");
-    if (!fs.existsSync(cfgPath)) {
-      return { ok: false, status: 500, error: "Konfigurasi Firebase belum tersedia." };
-    }
-    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+    const cfg = loadFirebaseConfig();
     if (!cfg.apiKey) {
       return { ok: false, status: 500, error: "API key Firebase tidak ditemukan." };
     }
@@ -377,9 +522,9 @@ function createApp() {
       res.status(status).json({ error: msg });
     }
   });
-  app.post("/api/portal/settings", (req, res) => {
-    const currentPin = String(req.body?.currentPin ?? "").trim();
-    if (!currentPin || !safeEqual(currentPin, state.settings.proctorPin)) {
+  app.post("/api/portal/settings", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: "PIN Pengawas tidak valid." });
       return;
     }
@@ -398,7 +543,7 @@ function createApp() {
       defaultTeacherName: String(incoming.defaultTeacherName ?? state.settings.defaultTeacherName).trim() || "Guru Kelas 5D",
       proctorPin: nextPin
     };
-    saveState();
+    await saveState();
     res.json({ settings: state.settings });
   });
   app.post("/api/exams/hydrate", async (req, res) => {
@@ -442,11 +587,20 @@ function createApp() {
         state.results[idx] = r;
       }
     }
-    saveState();
+    await saveState();
+    const now = Date.now();
     res.json({
       settings: state.settings,
       exams: state.exams,
-      results: state.results
+      results: state.results,
+      publicPayload: {
+        settings: {
+          className: state.settings.className,
+          defaultTeacherName: state.settings.defaultTeacherName
+        },
+        exams: state.exams.map((ex) => toPublicExam(ex, now)),
+        serverTime: now
+      }
     });
   });
   app.post("/api/exams/save", async (req, res) => {
@@ -517,7 +671,7 @@ function createApp() {
     );
     const kkm = Math.min(100, Math.max(0, Number(incoming.kkm ?? prev?.kkm ?? 75)));
     const savedExam = {
-      id: prev ? prev.id : crypto.randomUUID(),
+      id: prev ? prev.id : incoming.id || crypto.randomUUID(),
       examTitle,
       subject,
       teacherName: String(incoming.teacherName ?? "").trim() || state.settings.defaultTeacherName,
@@ -551,7 +705,7 @@ function createApp() {
     } else {
       state.exams.push(savedExam);
     }
-    saveState();
+    await saveState();
     res.json({
       exam: savedExam,
       exams: state.exams,
@@ -559,16 +713,16 @@ function createApp() {
       warning: normalized?.warning
     });
   });
-  app.post("/api/exams/delete", (req, res) => {
-    const currentPin = String(req.body?.currentPin ?? "").trim();
-    if (!currentPin || !safeEqual(currentPin, state.settings.proctorPin)) {
+  app.post("/api/exams/delete", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: "PIN Pengawas tidak valid." });
       return;
     }
     const examId = String(req.body?.examId ?? "").trim();
     state.exams = state.exams.filter((ex) => ex.id !== examId);
     state.results = state.results.filter((r) => r.examId !== examId);
-    saveState();
+    await saveState();
     res.json({ exams: state.exams, results: state.results });
   });
   app.post("/api/exams/:examId/results/import", async (req, res) => {
@@ -618,15 +772,15 @@ function createApp() {
         source: importSource
       });
     }
-    saveState();
+    await saveState();
     res.json({
       results: state.results.filter((r) => r.examId === exam.id),
       exams: state.exams
     });
   });
-  app.post("/api/exams/:examId/results/upsert", (req, res) => {
-    const currentPin = String(req.body?.currentPin ?? "").trim();
-    if (!currentPin || !safeEqual(currentPin, state.settings.proctorPin)) {
+  app.post("/api/exams/:examId/results/upsert", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: "PIN Pengawas tidak valid." });
       return;
     }
@@ -650,12 +804,12 @@ function createApp() {
       itemScores,
       source: "manual"
     });
-    saveState();
+    await saveState();
     res.json({ results: state.results.filter((r) => r.examId === exam.id) });
   });
-  app.post("/api/exams/:examId/results/delete", (req, res) => {
-    const currentPin = String(req.body?.currentPin ?? "").trim();
-    if (!currentPin || !safeEqual(currentPin, state.settings.proctorPin)) {
+  app.post("/api/exams/:examId/results/delete", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: "PIN Pengawas tidak valid." });
       return;
     }
@@ -665,10 +819,10 @@ function createApp() {
     } else {
       state.results = state.results.filter((r) => r.examId !== req.params.examId);
     }
-    saveState();
+    await saveState();
     res.json({ results: state.results.filter((r) => r.examId === req.params.examId) });
   });
-  app.post("/api/webhook/form-response/:examId", (req, res) => {
+  app.post("/api/webhook/form-response/:examId", async (req, res) => {
     const exam = state.exams.find((ex) => ex.id === req.params.examId);
     if (!exam) {
       res.status(404).json({ error: "Ulangan tidak ditemukan." });
@@ -699,20 +853,20 @@ function createApp() {
       submittedAt: Date.now(),
       source: "webhook"
     });
-    saveState();
+    await saveState();
     res.json({ ok: true, id: saved.id });
   });
-  app.post("/api/exam/reset-sessions", (req, res) => {
-    const pin = String(req.body?.pin ?? "").trim();
-    if (!pin || !safeEqual(pin, state.settings.proctorPin)) {
+  app.post("/api/exam/reset-sessions", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: "PIN Pengawas salah." });
       return;
     }
     state.sessions = [];
-    saveState();
+    await saveState();
     res.json({ ok: true });
   });
-  app.post("/api/sessions/start", (req, res) => {
+  app.post("/api/sessions/start", async (req, res) => {
     const examId = String(req.body?.examId ?? "").trim();
     const studentName = String(req.body?.studentName ?? "").trim();
     const absenNumber = String(req.body?.absenNumber ?? "").trim();
@@ -779,23 +933,24 @@ function createApp() {
         lastHeartbeat: now
       };
       state.sessions.push(session);
-      saveState();
     } else {
       session.lastHeartbeat = now;
-      saveState();
     }
-    const submitUnlocked = now >= session.unlockAt;
-    res.json({
-      session,
-      googleFormUrl: exam.googleFormUrl,
-      submitUnlocked,
-      submitToken: submitUnlocked && exam.enableSubmitToken ? exam.submitToken : null,
-      serverTime: now,
-      exam: toPublicExam(exam, now)
-    });
+    await saveState();
+    res.json(buildActiveSessionResponse(session, exam, now));
   });
+  function resolveSessionWithTokenFallback(sessionId, rawToken) {
+    let session = state.sessions.find((s) => s.id === sessionId) || null;
+    const envelope = verifySessionToken(rawToken);
+    if (!session && envelope && envelope.session.id === sessionId) {
+      session = envelope.session;
+      state.sessions.push(session);
+    }
+    return { session, envelope };
+  }
   app.get("/api/sessions/:id", (req, res) => {
-    const session = state.sessions.find((s) => s.id === req.params.id);
+    const tokenHeader = String(req.headers["x-session-token"] ?? "");
+    const { session, envelope } = resolveSessionWithTokenFallback(req.params.id, tokenHeader);
     if (!session) {
       res.status(404).json({ error: "Sesi ujian tidak ditemukan." });
       return;
@@ -803,36 +958,13 @@ function createApp() {
     const exam = state.exams.find((ex) => ex.id === session.examId);
     const now = Date.now();
     session.lastHeartbeat = now;
-    const submitUnlocked = now >= session.unlockAt;
-    const fallbackPublicExam = exam ? toPublicExam(exam, now) : {
-      id: session.examId,
-      examTitle: session.examTitle,
-      subject: session.subject,
-      className: state.settings.className,
-      teacherName: state.settings.defaultTeacherName,
-      durationMinutes: 60,
-      lockSubmitMinutes: 60,
-      enableSubmitToken: false,
-      enableBottomOverlayGuard: false,
-      maxViolationsBeforeLock: 3,
-      availabilityMode: "manual_open",
-      scheduledStart: "",
-      scheduledEnd: "",
-      hasFormUrl: true,
-      computedStatus: "open",
-      updatedAt: new Date(session.startedAt).toISOString()
-    };
-    res.json({
-      session,
-      googleFormUrl: exam?.googleFormUrl || "",
-      submitUnlocked,
-      submitToken: submitUnlocked && exam?.enableSubmitToken ? exam.submitToken : null,
-      serverTime: now,
-      exam: fallbackPublicExam
-    });
+    res.json(buildActiveSessionResponse(session, exam, now, envelope));
   });
-  app.post("/api/sessions/:id/violation", (req, res) => {
-    const session = state.sessions.find((s) => s.id === req.params.id);
+  app.post("/api/sessions/:id/violation", async (req, res) => {
+    const tokenHeader = String(
+      req.headers["x-session-token"] ?? req.body?.sessionToken ?? ""
+    );
+    const { session, envelope } = resolveSessionWithTokenFallback(req.params.id, tokenHeader);
     if (!session) {
       res.status(404).json({ error: "Sesi tidak ditemukan." });
       return;
@@ -842,7 +974,7 @@ function createApp() {
       return;
     }
     const exam = state.exams.find((ex) => ex.id === session.examId);
-    const maxViolations = exam?.maxViolationsBeforeLock ?? 3;
+    const maxViolations = exam?.maxViolationsBeforeLock ?? envelope?.maxViolationsBeforeLock ?? 3;
     const reason = String(req.body?.reason ?? "Keluar dari jendela ujian").trim();
     const now = Date.now();
     const last = session.violations[session.violations.length - 1];
@@ -852,11 +984,13 @@ function createApp() {
       if (activeStrikes >= maxViolations) {
         session.status = "locked";
       }
-      saveState();
+      await saveState();
     }
+    const activePayload = buildActiveSessionResponse(session, exam, now, envelope);
     res.json({
       session,
-      maxViolations
+      maxViolations,
+      sessionToken: activePayload.sessionToken
     });
   });
   app.post("/api/sessions/:id/unlock", async (req, res) => {
@@ -872,11 +1006,14 @@ function createApp() {
     }
     session.violations = session.violations.map((v) => ({ ...v, forgiven: true }));
     session.status = "active";
-    saveState();
+    await saveState();
     res.json({ session });
   });
-  app.post("/api/sessions/:id/finish", (req, res) => {
-    let session = state.sessions.find((s) => s.id === req.params.id);
+  app.post("/api/sessions/:id/finish", async (req, res) => {
+    const tokenHeader = String(
+      req.headers["x-session-token"] ?? req.body?.sessionToken ?? ""
+    );
+    let { session, envelope } = resolveSessionWithTokenFallback(req.params.id, tokenHeader);
     if (!session && req.body?.sessionSnapshot && typeof req.body.sessionSnapshot === "object") {
       const snap = req.body.sessionSnapshot;
       if (snap.examId && snap.studentName) {
@@ -926,8 +1063,9 @@ function createApp() {
         source: "kiosk"
       });
     }
-    saveState();
-    res.json({ session });
+    await saveState();
+    const activePayload = buildActiveSessionResponse(session, exam, now, envelope);
+    res.json({ session, sessionToken: activePayload.sessionToken });
   });
   app.post("/api/sessions/:id/force-unlock-submit", async (req, res) => {
     const session = state.sessions.find((s) => s.id === req.params.id);
@@ -941,11 +1079,14 @@ function createApp() {
       return;
     }
     session.unlockAt = Date.now() - 1e3;
-    saveState();
+    await saveState();
     res.json({ session });
   });
   return app;
 }
+
+// server.ts
+var PORT = Number(process.env.PORT) || 3e3;
 async function startServer() {
   const app = createApp();
   if (process.env.NODE_ENV !== "production") {
@@ -956,17 +1097,22 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(process.cwd(), "dist");
-    app.use(express.static(distDir));
+    const distDir = path2.resolve(process.cwd(), "dist");
+    app.use(express2.static(distDir));
     app.get("*", (_req, res) => {
-      res.sendFile(path.join(distDir, "index.html"));
+      res.sendFile(path2.join(distDir, "index.html"));
     });
   }
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Portal Ulangan Kelas 5D running on http://0.0.0.0:${PORT}`);
   });
 }
-startServer().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
+if (!process.env.VERCEL) {
+  startServer().catch((err) => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  });
+}
+export {
+  createApp
+};

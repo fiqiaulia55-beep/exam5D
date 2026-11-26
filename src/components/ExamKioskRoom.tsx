@@ -81,6 +81,17 @@ export function ExamKioskRoom({ initialData, onFinished }: ExamKioskRoomProps) {
   const prevUnlockedRef = useRef<boolean>(initialData.submitUnlocked);
   const lastViolationReportRef = useRef<number>(0);
   const isFinishingRef = useRef<boolean>(false);
+  const sessionTokenRef = useRef<string>(
+    initialData.sessionToken ||
+      (typeof window !== 'undefined' ? sessionStorage.getItem('cbt_5d_session_token') || '' : '')
+  );
+
+  useEffect(() => {
+    if (initialData.sessionToken && typeof window !== 'undefined') {
+      sessionTokenRef.current = initialData.sessionToken;
+      sessionStorage.setItem('cbt_5d_session_token', initialData.sessionToken);
+    }
+  }, [initialData.sessionToken]);
 
   const syncedNow = nowMs + serverOffsetMs;
   const remainingTotalSec = Math.max(0, Math.ceil((examData.session.endsAt - syncedNow) / 1000));
@@ -142,9 +153,17 @@ export function ExamKioskRoom({ initialData, onFinished }: ExamKioskRoomProps) {
   // Poll server every 2.5 seconds to sync unlock token & proctor remote unlock
   const syncWithServer = useCallback(async () => {
     try {
-      const res = await fetch(`/api/sessions/${examData.session.id}`);
+      const headers: Record<string, string> = {};
+      if (sessionTokenRef.current) {
+        headers['x-session-token'] = sessionTokenRef.current;
+      }
+      const res = await fetch(`/api/sessions/${examData.session.id}`, { headers });
       if (!res.ok) return;
       const fresh = (await res.json()) as ActiveExamPayload;
+      if (fresh.sessionToken) {
+        sessionTokenRef.current = fresh.sessionToken;
+        sessionStorage.setItem('cbt_5d_session_token', fresh.sessionToken);
+      }
       setServerOffsetMs(fresh.serverTime - Date.now());
       setExamData((prev) => {
         if (prev.session.status === 'locked' && fresh.session.status === 'active') {
@@ -154,6 +173,7 @@ export function ExamKioskRoom({ initialData, onFinished }: ExamKioskRoomProps) {
       });
       if (fresh.session.status === 'finished') {
         isFinishingRef.current = true;
+        sessionStorage.removeItem('cbt_5d_session_token');
         if (document.fullscreenElement) {
           document.exitFullscreen().catch(() => {});
         }
@@ -188,11 +208,21 @@ export function ExamKioskRoom({ initialData, onFinished }: ExamKioskRoomProps) {
       try {
         const res = await fetch(`/api/sessions/${examData.session.id}/violation`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reason }),
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+          },
+          body: JSON.stringify({
+            reason,
+            sessionToken: sessionTokenRef.current || undefined,
+          }),
         });
         if (res.ok) {
           const data = await res.json();
+          if (data.sessionToken) {
+            sessionTokenRef.current = data.sessionToken;
+            sessionStorage.setItem('cbt_5d_session_token', data.sessionToken);
+          }
           setExamData((prev) => ({ ...prev, session: data.session }));
         }
       } catch {
@@ -284,16 +314,21 @@ export function ExamKioskRoom({ initialData, onFinished }: ExamKioskRoomProps) {
     try {
       const res = await fetch(`/api/sessions/${examData.session.id}/finish`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({
           proctorPin: overridePin || '',
           sessionSnapshot: examData.session,
+          sessionToken: sessionTokenRef.current || undefined,
         }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         if (res.status === 404) {
           isFinishingRef.current = true;
+          sessionStorage.removeItem('cbt_5d_session_token');
           if (document.fullscreenElement) {
             document.exitFullscreen().catch(() => {});
           }
@@ -310,6 +345,7 @@ export function ExamKioskRoom({ initialData, onFinished }: ExamKioskRoomProps) {
         throw new Error(data.error || 'Belum bisa mengakhiri ujian.');
       }
       isFinishingRef.current = true;
+      sessionStorage.removeItem('cbt_5d_session_token');
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
       }

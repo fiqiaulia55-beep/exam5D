@@ -876,11 +876,13 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
         scheduledEnd: fromLocalDateTimeInput(endLocalInput),
       };
 
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
       const res = await fetch('/api/exams/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           currentPin: authenticatedPin,
+          idToken: idToken || undefined,
           exam: payloadExam,
         }),
       });
@@ -937,10 +939,15 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
   const handleDeleteExam = async (examId: string) => {
     if (!authenticatedPin) return;
     setFeedback(null);
+    const idToken = await auth.currentUser?.getIdToken().catch(() => '');
     const res = await fetch('/api/exams/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ currentPin: authenticatedPin, examId }),
+      body: JSON.stringify({
+        currentPin: authenticatedPin,
+        idToken: idToken || undefined,
+        examId,
+      }),
     });
     const data = await res.json();
     if (res.ok) {
@@ -955,11 +962,13 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
 
   const handleQuickModeChange = async (exam: ExamItem, mode: ExamAvailabilityMode) => {
     if (!authenticatedPin) return;
+    const idToken = await auth.currentUser?.getIdToken().catch(() => '');
     const res = await fetch('/api/exams/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         currentPin: authenticatedPin,
+        idToken: idToken || undefined,
         exam: { ...exam, availabilityMode: mode },
       }),
     });
@@ -979,11 +988,13 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
     setSaving(true);
     setFeedback(null);
     try {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
       const res = await fetch('/api/portal/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           currentPin: authenticatedPin,
+          idToken: idToken || undefined,
           settings: portalSettings,
         }),
       });
@@ -1051,10 +1062,14 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
 
   const handleResetSessions = async () => {
     if (!authenticatedPin) return;
+    const idToken = await auth.currentUser?.getIdToken().catch(() => '');
     const res = await fetch('/api/exam/reset-sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin: authenticatedPin }),
+      body: JSON.stringify({
+        pin: authenticatedPin,
+        idToken: idToken || undefined,
+      }),
     });
     if (res.ok) {
       setSessions([]);

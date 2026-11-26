@@ -106,6 +106,7 @@ export interface ActiveExamPayload {
   submitToken: string | null;
   serverTime: number;
   exam: ExamPublicItem;
+  sessionToken?: string;
 }
 
 export type PortalTab = 'gate' | 'monitor' | 'guide';

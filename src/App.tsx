@@ -12,6 +12,7 @@ import { ProctorPanel } from './components/ProctorPanel.tsx';
 import type { ActiveExamPayload, ExamItem, PortalPublicPayload, PortalSettings, PortalTab } from './types.ts';
 
 const SESSION_STORAGE_KEY = 'cbt_5d_session_id';
+const SESSION_TOKEN_STORAGE_KEY = 'cbt_5d_session_token';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<PortalTab>('gate');
@@ -23,6 +24,41 @@ export default function App() {
   const [finishedExam, setFinishedExam] = useState<ActiveExamPayload | null>(null);
   const [proctorOpen, setProctorOpen] = useState(false);
   const autoHydratedUidRef = useRef<string | null>(null);
+  const cachedFirestoreSnapshotRef = useRef<{
+    settings?: Partial<PortalSettings>;
+    exams?: Partial<ExamItem>[];
+  }>({});
+  const rehydratingColdRef = useRef(false);
+
+  const hydrateServerFromCachedFirestore = useCallback(async (): Promise<PortalPublicPayload | null> => {
+    const snap = cachedFirestoreSnapshotRef.current;
+    const user = auth.currentUser;
+    if (!user || !user.emailVerified) return null;
+    if (!snap.settings && (!snap.exams || snap.exams.length === 0)) return null;
+    if (rehydratingColdRef.current) return null;
+
+    rehydratingColdRef.current = true;
+    try {
+      const idToken = await user.getIdToken().catch(() => '');
+      if (!idToken) return null;
+      const res = await fetch('/api/exams/hydrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          idToken,
+          settings: snap.settings,
+          exams: snap.exams,
+        }),
+      });
+      if (!res.ok) return null;
+      const hydrated = (await res.json()) as { publicPayload?: PortalPublicPayload };
+      return hydrated.publicPayload || null;
+    } catch {
+      return null;
+    } finally {
+      rehydratingColdRef.current = false;
+    }
+  }, []);
 
   const fetchPortalData = useCallback(async () => {
     try {
@@ -31,6 +67,18 @@ export default function App() {
         throw new Error('Gagal memuat daftar jadwal ulangan.');
       }
       const data = (await res.json()) as PortalPublicPayload;
+      if (
+        data.exams.length === 0 &&
+        (cachedFirestoreSnapshotRef.current.exams?.length || 0) > 0 &&
+        auth.currentUser?.emailVerified
+      ) {
+        const rehydratedPublic = await hydrateServerFromCachedFirestore();
+        if (rehydratedPublic) {
+          setPortalData(rehydratedPublic);
+          setLoadError(null);
+          return;
+        }
+      }
       setPortalData(data);
       setLoadError(null);
     } catch (err) {
@@ -38,7 +86,7 @@ export default function App() {
     } finally {
       setLoadingPortal(false);
     }
-  }, []);
+  }, [hydrateServerFromCachedFirestore]);
 
   useEffect(() => {
     fetchPortalData();
@@ -106,6 +154,8 @@ export default function App() {
           };
         });
 
+        cachedFirestoreSnapshotRef.current = { settings, exams };
+
         if (settings || exams.length > 0) {
           const res = await fetch('/api/exams/hydrate', {
             method: 'POST',
@@ -113,7 +163,16 @@ export default function App() {
             body: JSON.stringify({ idToken, settings, exams }),
           });
           if (res.ok) {
-            void fetchPortalData();
+            const hydrated = (await res.json().catch(() => null)) as {
+              publicPayload?: PortalPublicPayload;
+            } | null;
+            if (hydrated?.publicPayload) {
+              setPortalData(hydrated.publicPayload);
+              setLoadError(null);
+              setLoadingPortal(false);
+            } else {
+              void fetchPortalData();
+            }
           }
         }
       } catch {
@@ -125,16 +184,24 @@ export default function App() {
 
   useEffect(() => {
     const savedSessionId = sessionStorage.getItem(SESSION_STORAGE_KEY);
+    const savedSessionToken = sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
     if (savedSessionId) {
-      fetch(`/api/sessions/${savedSessionId}`)
+      fetch(`/api/sessions/${savedSessionId}`, {
+        headers: savedSessionToken ? { 'x-session-token': savedSessionToken } : undefined,
+      })
         .then(async (res) => {
           if (!res.ok) {
             sessionStorage.removeItem(SESSION_STORAGE_KEY);
+            sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
             return;
           }
           const payload = (await res.json()) as ActiveExamPayload;
+          if (payload.sessionToken) {
+            sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, payload.sessionToken);
+          }
           if (payload.session.status === 'finished') {
             sessionStorage.removeItem(SESSION_STORAGE_KEY);
+            sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
             setFinishedExam(payload);
           } else {
             setActiveExam(payload);
@@ -150,23 +217,39 @@ export default function App() {
     absenNumber: string,
     token: string
   ) => {
-    const res = await fetch('/api/sessions/start', {
+    let res = await fetch('/api/sessions/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ examId, studentName, absenNumber, token }),
     });
+    if (
+      res.status === 404 &&
+      (cachedFirestoreSnapshotRef.current.exams?.length || 0) > 0 &&
+      auth.currentUser?.emailVerified
+    ) {
+      await hydrateServerFromCachedFirestore();
+      res = await fetch('/api/sessions/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ examId, studentName, absenNumber, token }),
+      });
+    }
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data.error || 'Token tidak valid atau sesi gagal dimulai.');
     }
     const payload = data as ActiveExamPayload;
     sessionStorage.setItem(SESSION_STORAGE_KEY, payload.session.id);
+    if (payload.sessionToken) {
+      sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, payload.sessionToken);
+    }
     setFinishedExam(null);
     setActiveExam(payload);
   };
 
   const handleExamFinished = (payload: ActiveExamPayload) => {
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
     setActiveExam(null);
     setFinishedExam(payload);
   };
