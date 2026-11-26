@@ -1,0 +1,6 @@
+{
+  "name": "Portal Ulangan Kelas 5D",
+  "description": "Portal CBT Ulangan Kelas 5D terintegrasi Google Form dengan akses token, kunci fokus layar Chromebook, dan pengatur waktu kirim otomatis 1 jam.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

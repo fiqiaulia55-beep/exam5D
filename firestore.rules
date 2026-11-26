@@ -1,0 +1,330 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Global Hardened Helper Primitives
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isPrimaryTeacherEmail() {
+      return isVerifiedUser() && request.auth.token.email == 'fiqi.aulia55@guru.sd.belajar.id';
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        isPrimaryTeacherEmail() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwnerOrAdmin(data) {
+      return isVerifiedUser() && (
+        data.ownerUid == request.auth.uid ||
+        isAdmin()
+      );
+    }
+
+    function isParentExamOwnerOrAdmin(examId) {
+      return isVerifiedUser() && (
+        isAdmin() ||
+        get(/databases/$(database)/documents/exams/$(examId)).data.ownerUid == request.auth.uid
+      );
+    }
+
+    function isListQueryAuthorized() {
+      return isVerifiedUser() && (
+        isPrimaryTeacherEmail() ||
+        resource.data.ownerUid == request.auth.uid
+      );
+    }
+
+    // =========================================================================
+    // Entity Validation Blueprints (Strict Schema + Bounds + Ownership)
+    // =========================================================================
+    function isValidPortalConfig(data) {
+      return data.keys().hasAll([
+          'className', 'defaultTeacherName', 'proctorPin', 'ownerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'className', 'defaultTeacherName', 'proctorPin', 'ownerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 80 &&
+        data.defaultTeacherName is string && data.defaultTeacherName.size() >= 1 && data.defaultTeacherName.size() <= 120 &&
+        data.proctorPin is string && data.proctorPin.size() >= 4 && data.proctorPin.size() <= 32 &&
+        isValidId(data.ownerUid) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidExam(data, examId) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'examTitle', 'subject', 'teacherName', 'googleFormUrl',
+          'entryToken', 'submitToken', 'durationMinutes', 'lockSubmitMinutes',
+          'enableSubmitToken', 'enableBottomOverlayGuard', 'maxViolationsBeforeLock',
+          'availabilityMode', 'scheduledStart', 'scheduledEnd', 'maxRawScore',
+          'questionCount', 'kkm', 'webhookSecret', 'answerKey', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'ownerUid', 'examTitle', 'subject', 'teacherName', 'googleFormUrl', 'googleFormId',
+          'entryToken', 'submitToken', 'durationMinutes', 'lockSubmitMinutes',
+          'enableSubmitToken', 'enableBottomOverlayGuard', 'maxViolationsBeforeLock',
+          'availabilityMode', 'scheduledStart', 'scheduledEnd', 'maxRawScore',
+          'questionCount', 'kkm', 'webhookSecret', 'answerKey', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == examId &&
+        isValidId(data.ownerUid) &&
+        data.examTitle is string && data.examTitle.size() >= 1 && data.examTitle.size() <= 160 &&
+        data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 100 &&
+        data.teacherName is string && data.teacherName.size() >= 1 && data.teacherName.size() <= 120 &&
+        data.googleFormUrl is string && data.googleFormUrl.size() <= 1000 &&
+        (!('googleFormId' in data) || (data.googleFormId is string && data.googleFormId.size() <= 128)) &&
+        data.entryToken is string && data.entryToken.size() >= 1 && data.entryToken.size() <= 40 &&
+        data.submitToken is string && data.submitToken.size() >= 1 && data.submitToken.size() <= 40 &&
+        (data.durationMinutes is int || data.durationMinutes is float) && data.durationMinutes >= 1 && data.durationMinutes <= 240 &&
+        (data.lockSubmitMinutes is int || data.lockSubmitMinutes is float) && data.lockSubmitMinutes >= 0 && data.lockSubmitMinutes <= 240 &&
+        data.enableSubmitToken is bool &&
+        data.enableBottomOverlayGuard is bool &&
+        (data.maxViolationsBeforeLock is int || data.maxViolationsBeforeLock is float) && data.maxViolationsBeforeLock >= 1 && data.maxViolationsBeforeLock <= 10 &&
+        data.availabilityMode is string && data.availabilityMode.size() <= 20 && data.availabilityMode in ['scheduled', 'manual_open', 'closed'] &&
+        data.scheduledStart is string && data.scheduledStart.size() <= 64 &&
+        data.scheduledEnd is string && data.scheduledEnd.size() <= 64 &&
+        (data.maxRawScore is int || data.maxRawScore is float) && data.maxRawScore >= 1 && data.maxRawScore <= 500 &&
+        (data.questionCount is int || data.questionCount is float) && data.questionCount >= 1 && data.questionCount <= 100 &&
+        (data.kkm is int || data.kkm is float) && data.kkm >= 0 && data.kkm <= 100 &&
+        data.webhookSecret is string && data.webhookSecret.size() >= 1 && data.webhookSecret.size() <= 128 &&
+        data.answerKey is list && data.answerKey.size() <= 100 &&
+        (data.answerKey.size() == 0 || (data.answerKey[0] is string && data.answerKey[0].size() <= 200)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidExamResult(data, examId, resultId) {
+      return data.keys().hasAll([
+          'id', 'examId', 'ownerUid', 'studentName', 'absenNumber',
+          'rawScore', 'finalScore', 'itemScores', 'submittedAt', 'source',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'examId', 'ownerUid', 'studentName', 'absenNumber',
+          'rawScore', 'finalScore', 'itemScores', 'answers', 'submittedAt',
+          'source', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == resultId &&
+        isValidId(data.examId) && data.examId == examId &&
+        isValidId(data.ownerUid) &&
+        data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120 &&
+        data.absenNumber is string && data.absenNumber.size() >= 1 && data.absenNumber.size() <= 24 &&
+        (data.rawScore is int || data.rawScore is float) && data.rawScore >= 0 && data.rawScore <= 500 &&
+        (data.finalScore is int || data.finalScore is float) && data.finalScore >= 0 && data.finalScore <= 1000 &&
+        data.itemScores is list && data.itemScores.size() <= 100 &&
+        (data.itemScores.size() == 0 || (data.itemScores[0] is int && (data.itemScores[0] == 0 || data.itemScores[0] == 1))) &&
+        (!('answers' in data) || (
+          data.answers is list && data.answers.size() <= 100 &&
+          (data.answers.size() == 0 || (data.answers[0] is string && data.answers[0].size() <= 500))
+        )) &&
+        (data.submittedAt is int || data.submittedAt is float) && data.submittedAt >= 0 &&
+        data.source is string && data.source.size() <= 20 && data.source in ['webhook', 'csv', 'manual', 'kiosk', 'google_forms'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidExamSession(data, sessionId) {
+      return data.keys().hasAll([
+          'id', 'examId', 'ownerUid', 'examTitle', 'subject', 'studentName',
+          'absenNumber', 'startedAt', 'endsAt', 'unlockAt', 'status',
+          'violationCount', 'finishedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'examId', 'ownerUid', 'examTitle', 'subject', 'studentName',
+          'absenNumber', 'startedAt', 'endsAt', 'unlockAt', 'status',
+          'violationCount', 'finishedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == sessionId &&
+        isValidId(data.examId) &&
+        isValidId(data.ownerUid) &&
+        data.examTitle is string && data.examTitle.size() >= 1 && data.examTitle.size() <= 160 &&
+        data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 100 &&
+        data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120 &&
+        data.absenNumber is string && data.absenNumber.size() >= 1 && data.absenNumber.size() <= 24 &&
+        (data.startedAt is int || data.startedAt is float) && data.startedAt >= 0 &&
+        (data.endsAt is int || data.endsAt is float) && data.endsAt >= 0 &&
+        (data.unlockAt is int || data.unlockAt is float) && data.unlockAt >= 0 &&
+        data.status is string && data.status.size() <= 20 && data.status in ['active', 'locked', 'finished'] &&
+        (data.violationCount is int || data.violationCount is float) && data.violationCount >= 0 && data.violationCount <= 1000 &&
+        (data.finishedAt is int || data.finishedAt is float) && data.finishedAt >= 0 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAdminUser(data, uid) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        isValidId(data.uid) && data.uid == uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.createdAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collections
+    // =========================================================================
+
+    // Startup connection check document
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // Authorized primary admins lookup (no self-assigned role escalation)
+    match /admins/{uid} {
+      allow get: if isVerifiedUser() && isValidId(uid) && (request.auth.uid == uid || isPrimaryTeacherEmail());
+      allow create: if isPrimaryTeacherEmail() &&
+        isValidId(uid) &&
+        isValidAdminUser(incoming(), uid) &&
+        incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // Portal settings (owner-scoped per teacher UID, or 'default' for primary teacher)
+    match /portalConfig/{configId} {
+      allow get: if isVerifiedUser() && isValidId(configId) && (
+        (resource == null && (configId == request.auth.uid || (configId == 'default' && isAdmin()))) ||
+        (resource != null && isOwnerOrAdmin(existing()))
+      );
+      allow list: if isListQueryAuthorized();
+      allow create: if isVerifiedUser() &&
+        isValidId(configId) &&
+        isValidPortalConfig(incoming()) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (configId == request.auth.uid || isAdmin());
+      allow update: if isVerifiedUser() &&
+        isValidId(configId) &&
+        isValidPortalConfig(incoming()) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'className', 'defaultTeacherName', 'proctorPin', 'updatedAt'
+        ]) &&
+        isOwnerOrAdmin(existing());
+      allow delete: if isVerifiedUser() && isValidId(configId) && isOwnerOrAdmin(existing());
+    }
+
+    // Scheduled exams & nested student results (isolated per verified teacher owner)
+    match /exams/{examId} {
+      allow get: if isVerifiedUser() && isValidId(examId) && (
+        resource == null || isOwnerOrAdmin(existing())
+      );
+      allow list: if isListQueryAuthorized();
+      allow create: if isVerifiedUser() &&
+        isValidId(examId) &&
+        isValidExam(incoming(), examId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser() &&
+        isValidId(examId) &&
+        isValidExam(incoming(), examId) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'examTitle', 'subject', 'teacherName', 'googleFormUrl', 'googleFormId',
+          'entryToken', 'submitToken', 'durationMinutes', 'lockSubmitMinutes',
+          'enableSubmitToken', 'enableBottomOverlayGuard', 'maxViolationsBeforeLock',
+          'availabilityMode', 'scheduledStart', 'scheduledEnd', 'maxRawScore',
+          'questionCount', 'kkm', 'webhookSecret', 'answerKey', 'updatedAt'
+        ]) &&
+        isOwnerOrAdmin(existing());
+      allow delete: if isVerifiedUser() && isValidId(examId) && isOwnerOrAdmin(existing());
+
+      // Nested student results & per-item scores (Teacher-only access)
+      match /results/{resultId} {
+        allow get: if isVerifiedUser() && isValidId(examId) && isValidId(resultId) &&
+          exists(/databases/$(database)/documents/exams/$(examId)) && (
+            (resource == null && isParentExamOwnerOrAdmin(examId)) ||
+            (resource != null && isOwnerOrAdmin(existing()))
+          );
+        allow list: if isListQueryAuthorized();
+        allow create: if isVerifiedUser() &&
+          isValidId(examId) &&
+          isValidId(resultId) &&
+          isValidExamResult(incoming(), examId, resultId) &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/exams/$(examId)) &&
+          isParentExamOwnerOrAdmin(examId);
+        allow update: if isVerifiedUser() &&
+          isValidId(examId) &&
+          isValidId(resultId) &&
+          isValidExamResult(incoming(), examId, resultId) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().examId == existing().examId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'studentName', 'absenNumber', 'rawScore', 'finalScore',
+            'itemScores', 'answers', 'submittedAt', 'source', 'updatedAt'
+          ]) &&
+          exists(/databases/$(database)/documents/exams/$(examId)) &&
+          isOwnerOrAdmin(existing()) &&
+          isParentExamOwnerOrAdmin(examId);
+        allow delete: if isVerifiedUser() && isValidId(examId) && isValidId(resultId) && isOwnerOrAdmin(existing());
+      }
+    }
+
+    // Student kiosk session logs synced to teacher oversight
+    match /sessions/{sessionId} {
+      allow get: if isVerifiedUser() && isValidId(sessionId) && (
+        resource == null || isOwnerOrAdmin(existing())
+      );
+      allow list: if isListQueryAuthorized();
+      allow create: if isVerifiedUser() &&
+        isValidId(sessionId) &&
+        isValidExamSession(incoming(), sessionId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/exams/$(incoming().examId)) &&
+        isParentExamOwnerOrAdmin(incoming().examId);
+      allow update: if isVerifiedUser() &&
+        isValidId(sessionId) &&
+        isValidExamSession(incoming(), sessionId) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().examId == existing().examId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'violationCount', 'endsAt', 'unlockAt', 'finishedAt', 'updatedAt'
+        ]) &&
+        (existing().status != 'finished' || isOwnerOrAdmin(existing())) &&
+        isOwnerOrAdmin(existing());
+      allow delete: if isVerifiedUser() && isValidId(sessionId) && isOwnerOrAdmin(existing());
+    }
+  }
+}

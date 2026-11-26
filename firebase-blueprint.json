@@ -1,0 +1,451 @@
+{
+  "entities": {
+    "PortalConfig": {
+      "title": "PortalConfig",
+      "description": "Global class portal configuration and proctor PIN managed by the class teacher.",
+      "type": "object",
+      "properties": {
+        "className": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Class label such as Kelas 5D."
+        },
+        "defaultTeacherName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Default homeroom teacher name."
+        },
+        "proctorPin": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 32,
+          "description": "Proctor PIN used for Kiosk emergency override and Panel Guru quick unlock."
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the teacher who owns this configuration."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when config was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last update."
+        }
+      },
+      "required": [
+        "className",
+        "defaultTeacherName",
+        "proctorPin",
+        "ownerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Exam": {
+      "title": "Exam",
+      "description": "Scheduled CBT exam configuration wrapping a custom Google Form link.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique exam identifier."
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the teacher who created the exam."
+        },
+        "examTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Custom exam title."
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Custom subject name."
+        },
+        "teacherName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Teacher name assigned to the exam."
+        },
+        "googleFormUrl": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Normalized embedded Google Form URL."
+        },
+        "googleFormId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Optional Google Drive/Forms File ID for direct Google Forms API grading."
+        },
+        "entryToken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Entry token required for students to start the exam."
+        },
+        "submitToken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Submit token revealed after lockSubmitMinutes."
+        },
+        "durationMinutes": {
+          "type": "number",
+          "description": "Total exam duration in minutes."
+        },
+        "lockSubmitMinutes": {
+          "type": "number",
+          "description": "Minimum wait time in minutes before submit is allowed."
+        },
+        "enableSubmitToken": {
+          "type": "boolean",
+          "description": "Whether submit token is shown upon unlock."
+        },
+        "enableBottomOverlayGuard": {
+          "type": "boolean",
+          "description": "Whether bottom submit area overlay guard is enabled."
+        },
+        "maxViolationsBeforeLock": {
+          "type": "number",
+          "description": "Number of focus violations before auto-lock."
+        },
+        "availabilityMode": {
+          "type": "string",
+          "enum": ["scheduled", "manual_open", "closed"],
+          "maxLength": 20,
+          "description": "Exam availability mode."
+        },
+        "scheduledStart": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "ISO timestamp for scheduled start."
+        },
+        "scheduledEnd": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "ISO timestamp for scheduled end."
+        },
+        "maxRawScore": {
+          "type": "number",
+          "description": "Score divisor used in (rawScore / maxRawScore) * 100."
+        },
+        "questionCount": {
+          "type": "number",
+          "description": "Number of questions for item analysis."
+        },
+        "kkm": {
+          "type": "number",
+          "description": "Minimum passing score threshold."
+        },
+        "webhookSecret": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Secret for Google Apps Script webhook."
+        },
+        "answerKey": {
+          "type": "array",
+          "description": "Optional answer key list up to 100 items."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when exam was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last update."
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "examTitle",
+        "subject",
+        "teacherName",
+        "googleFormUrl",
+        "entryToken",
+        "submitToken",
+        "durationMinutes",
+        "lockSubmitMinutes",
+        "enableSubmitToken",
+        "enableBottomOverlayGuard",
+        "maxViolationsBeforeLock",
+        "availabilityMode",
+        "scheduledStart",
+        "scheduledEnd",
+        "maxRawScore",
+        "questionCount",
+        "kkm",
+        "webhookSecret",
+        "answerKey",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ExamResult": {
+      "title": "ExamResult",
+      "description": "Student final score and per-item binary correctness stored for teacher grading and item analysis.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique result identifier."
+        },
+        "examId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent exam identifier."
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the teacher managing this exam result."
+        },
+        "studentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Student full name."
+        },
+        "absenNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "description": "Student attendance number."
+        },
+        "rawScore": {
+          "type": "number",
+          "description": "Raw score obtained by the student."
+        },
+        "finalScore": {
+          "type": "number",
+          "description": "Computed final score (rawScore / maxRawScore) * 100."
+        },
+        "itemScores": {
+          "type": "array",
+          "description": "Binary per-item correctness array (0 or 1), max 100 items."
+        },
+        "answers": {
+          "type": "array",
+          "description": "Optional student answer strings, max 100 items."
+        },
+        "submittedAt": {
+          "type": "number",
+          "description": "Epoch milliseconds when the student submitted."
+        },
+        "source": {
+          "type": "string",
+          "enum": ["webhook", "csv", "manual", "kiosk", "google_forms"],
+          "maxLength": 20,
+          "description": "Origin of the submission record."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "examId",
+        "ownerUid",
+        "studentName",
+        "absenNumber",
+        "rawScore",
+        "finalScore",
+        "itemScores",
+        "submittedAt",
+        "source",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ExamSession": {
+      "title": "ExamSession",
+      "description": "Persisted record of a student kiosk exam session for teacher monitoring.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique session identifier."
+        },
+        "examId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated exam identifier."
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the teacher monitoring this session."
+        },
+        "examTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Exam title snapshot."
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Subject snapshot."
+        },
+        "studentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Student full name."
+        },
+        "absenNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "description": "Student attendance number."
+        },
+        "startedAt": {
+          "type": "number",
+          "description": "Session start epoch ms."
+        },
+        "endsAt": {
+          "type": "number",
+          "description": "Session end epoch ms."
+        },
+        "unlockAt": {
+          "type": "number",
+          "description": "Submit unlock epoch ms."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "locked", "finished"],
+          "maxLength": 20,
+          "description": "Current kiosk session state."
+        },
+        "violationCount": {
+          "type": "number",
+          "description": "Count of focus violations."
+        },
+        "finishedAt": {
+          "type": "number",
+          "description": "Epoch ms when finished (0 if active)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when session record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "examId",
+        "ownerUid",
+        "examTitle",
+        "subject",
+        "studentName",
+        "absenNumber",
+        "startedAt",
+        "endsAt",
+        "unlockAt",
+        "status",
+        "violationCount",
+        "finishedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Authorized teacher account document for RBAC lookup.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID."
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 160,
+          "description": "Verified teacher email address."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when admin entry was created."
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/portalConfig/{configId}": {
+      "schema": { "$ref": "#/entities/PortalConfig" },
+      "description": "Stores portal-wide class settings and proctor PIN."
+    },
+    "/exams/{examId}": {
+      "schema": { "$ref": "#/entities/Exam" },
+      "description": "Stores scheduled exams and their Google Form URLs, tokens, and grading formulas."
+    },
+    "/exams/{examId}/results/{resultId}": {
+      "schema": { "$ref": "#/entities/ExamResult" },
+      "description": "Stores student scores and per-item binary scores for item analysis."
+    },
+    "/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/ExamSession" },
+      "description": "Stores student kiosk session summaries synced for teacher oversight."
+    },
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "Stores authorized teacher admin UIDs."
+    }
+  }
+}
