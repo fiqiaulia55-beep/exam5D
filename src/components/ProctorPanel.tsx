@@ -302,10 +302,11 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
 
   const fetchProctorData = useCallback(
     async (activePin: string, options?: { syncAll?: boolean }) => {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
       const res = await fetch('/api/exam/verify-proctor', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: activePin }),
+        body: JSON.stringify({ pin: activePin, idToken: idToken || undefined }),
       });
       const data = await res.json();
       if (!res.ok) {

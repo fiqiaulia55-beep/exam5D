@@ -10,6 +10,20 @@ import crypto from "crypto";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 
+// firebase-applet-config.json
+var firebase_applet_config_default = {
+  projectId: "gen-lang-client-0342477582",
+  appId: "1:1078225631259:web:b8b55178925f152d98a0be",
+  apiKey: "AIzaSyC7UKO6W3g0JAt0rW_YTEDTzEQR8gj_1aE",
+  authDomain: "gen-lang-client-0342477582.firebaseapp.com",
+  firestoreDatabaseId: "ai-studio-portalulangankel-4b3f0791-1b16-448f-bda2-b7621eb50f19",
+  storageBucket: "gen-lang-client-0342477582.firebasestorage.app",
+  messagingSenderId: "1078225631259",
+  measurementId: "",
+  oAuthClientId: "1078225631259-3gotac2k8ijto23kj4r6k25v8edg4ak7.apps.googleusercontent.com",
+  recaptchaSiteKey: ""
+};
+
 // src/utils/formUrl.ts
 function normalizeGoogleFormUrl(rawUrl) {
   const trimmed = rawUrl.trim();
@@ -74,8 +88,15 @@ function calculateFinalScore(rawScore, maxRawScore = 40) {
 
 // server/app.ts
 dotenv.config();
-var __filename = fileURLToPath(import.meta.url);
-var __dirname = path.dirname(__filename);
+var CURRENT_DIR = (() => {
+  try {
+    if (typeof import.meta !== "undefined" && import.meta.url) {
+      return path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {
+  }
+  return process.cwd();
+})();
 var IS_VERCEL = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 var DATA_DIR = IS_VERCEL ? path.join("/tmp", "portal-cbt-5d") : path.resolve(process.cwd(), "data");
 var STATE_FILE = path.join(DATA_DIR, "portal-state.json");
@@ -88,7 +109,7 @@ var KV_STATE_KEY = process.env.PORTAL_KV_KEY || "portal_cbt_5d_state_v1";
 function loadFirebaseConfig() {
   const candidates = [
     path.resolve(process.cwd(), "firebase-applet-config.json"),
-    path.resolve(__dirname, "../firebase-applet-config.json")
+    path.resolve(CURRENT_DIR, "../firebase-applet-config.json")
   ];
   for (const cfgPath of candidates) {
     try {
@@ -97,6 +118,9 @@ function loadFirebaseConfig() {
       }
     } catch {
     }
+  }
+  if (firebase_applet_config_default && typeof firebase_applet_config_default === "object") {
+    return firebase_applet_config_default;
   }
   return {
     apiKey: process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY,
@@ -175,14 +199,22 @@ async function syncStateFromKv(force = false) {
   const now = Date.now();
   if (!force && now - lastKvSyncMs < 1e3) return;
   try {
-    const res = await fetch(`${KV_URL}/get/${encodeURIComponent(KV_STATE_KEY)}`, {
-      headers: { Authorization: `Bearer ${KV_TOKEN}` }
+    const res = await fetch(KV_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${KV_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(["GET", KV_STATE_KEY])
     });
     if (!res.ok) return;
     const data = await res.json();
-    if (data.result) {
-      const parsed = JSON.parse(data.result);
-      state = normalizeParsedState(parsed);
+    if (typeof data.result === "string" && data.result) {
+      const parsedValue = JSON.parse(data.result);
+      const parsedObj = typeof parsedValue === "string" ? JSON.parse(parsedValue) : parsedValue;
+      if (parsedObj && typeof parsedObj === "object") {
+        state = normalizeParsedState(parsedObj);
+      }
     }
     lastKvSyncMs = Date.now();
   } catch {
@@ -197,13 +229,13 @@ async function saveState() {
   }
   if (KV_URL && KV_TOKEN) {
     try {
-      await fetch(`${KV_URL}/set/${encodeURIComponent(KV_STATE_KEY)}`, {
+      await fetch(KV_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${KV_TOKEN}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(serialized)
+        body: JSON.stringify(["SET", KV_STATE_KEY, serialized])
       });
       lastKvSyncMs = Date.now();
     } catch {
@@ -374,6 +406,14 @@ function createApp() {
     await syncStateFromKv(false);
     next();
   });
+  app.get("/api/health", (_req, res) => {
+    res.json({
+      ok: true,
+      vercel: IS_VERCEL,
+      hasKv: Boolean(KV_URL && KV_TOKEN),
+      examCount: state.exams.length
+    });
+  });
   app.get("/api/exam/public", (_req, res) => {
     const now = Date.now();
     const sortedExams = state.exams.slice().sort((a, b) => {
@@ -410,9 +450,9 @@ function createApp() {
     }));
     res.json({ sessions: list, serverTime: now });
   });
-  app.post("/api/exam/verify-proctor", (req, res) => {
-    const pin = String(req.body?.pin ?? "").trim();
-    if (!pin || !safeEqual(pin, state.settings.proctorPin)) {
+  app.post("/api/exam/verify-proctor", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: "PIN Pengawas tidak sesuai." });
       return;
     }

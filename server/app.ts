@@ -4,6 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import bundledFirebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 import { normalizeGoogleFormUrl } from '../src/utils/formUrl';
 import { calculateFinalScore } from '../src/utils/itemAnalysis';
 import type {
@@ -17,8 +18,16 @@ import type {
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const CURRENT_DIR = (() => {
+  try {
+    if (typeof import.meta !== 'undefined' && import.meta.url) {
+      return path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {
+    // Fallback for CJS / bundled serverless environments
+  }
+  return process.cwd();
+})();
 
 const IS_VERCEL = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 const DATA_DIR = IS_VERCEL
@@ -43,7 +52,7 @@ interface FirebaseAppletConfig {
 function loadFirebaseConfig(): FirebaseAppletConfig {
   const candidates = [
     path.resolve(process.cwd(), 'firebase-applet-config.json'),
-    path.resolve(__dirname, '../firebase-applet-config.json'),
+    path.resolve(CURRENT_DIR, '../firebase-applet-config.json'),
   ];
   for (const cfgPath of candidates) {
     try {
@@ -53,6 +62,9 @@ function loadFirebaseConfig(): FirebaseAppletConfig {
     } catch {
       // Try next path
     }
+  }
+  if (bundledFirebaseConfig && typeof bundledFirebaseConfig === 'object') {
+    return bundledFirebaseConfig as FirebaseAppletConfig;
   }
   return {
     apiKey: process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY,
@@ -161,14 +173,25 @@ async function syncStateFromKv(force = false): Promise<void> {
   const now = Date.now();
   if (!force && now - lastKvSyncMs < 1000) return;
   try {
-    const res = await fetch(`${KV_URL}/get/${encodeURIComponent(KV_STATE_KEY)}`, {
-      headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    const res = await fetch(KV_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${KV_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(['GET', KV_STATE_KEY]),
     });
     if (!res.ok) return;
     const data = (await res.json()) as { result?: string | null };
-    if (data.result) {
-      const parsed = JSON.parse(data.result) as Partial<PortalState>;
-      state = normalizeParsedState(parsed);
+    if (typeof data.result === 'string' && data.result) {
+      const parsedValue = JSON.parse(data.result) as Partial<PortalState> | string;
+      const parsedObj =
+        typeof parsedValue === 'string'
+          ? (JSON.parse(parsedValue) as Partial<PortalState>)
+          : parsedValue;
+      if (parsedObj && typeof parsedObj === 'object') {
+        state = normalizeParsedState(parsedObj);
+      }
     }
     lastKvSyncMs = Date.now();
   } catch {
@@ -187,13 +210,13 @@ async function saveState(): Promise<void> {
 
   if (KV_URL && KV_TOKEN) {
     try {
-      await fetch(`${KV_URL}/set/${encodeURIComponent(KV_STATE_KEY)}`, {
+      await fetch(KV_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${KV_TOKEN}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(serialized),
+        body: JSON.stringify(['SET', KV_STATE_KEY, serialized]),
       });
       lastKvSyncMs = Date.now();
     } catch {
@@ -413,6 +436,15 @@ export function createApp() {
     next();
   });
 
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      ok: true,
+      vercel: IS_VERCEL,
+      hasKv: Boolean(KV_URL && KV_TOKEN),
+      examCount: state.exams.length,
+    });
+  });
+
   // Public exam schedule list (no tokens, PINs, or student scores leaked)
   app.get('/api/exam/public', (_req, res) => {
     const now = Date.now();
@@ -461,9 +493,9 @@ export function createApp() {
   });
 
   // Proctor authentication & full exam/session/results fetch
-  app.post('/api/exam/verify-proctor', (req, res) => {
-    const pin = String(req.body?.pin ?? '').trim();
-    if (!pin || !safeEqual(pin, state.settings.proctorPin)) {
+  app.post('/api/exam/verify-proctor', async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
       res.status(401).json({ error: 'PIN Pengawas tidak sesuai.' });
       return;
     }

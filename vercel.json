@@ -3,7 +3,7 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/index.ts": {
+    "api/index.mjs": {
       "includeFiles": "firebase-applet-config.json"
     }
   },
@@ -20,8 +20,12 @@
   ],
   "rewrites": [
     {
+      "source": "/api",
+      "destination": "/api/index?__vercel_path="
+    },
+    {
       "source": "/api/(.*)",
-      "destination": "/api/index"
+      "destination": "/api/index?__vercel_path=$1"
     },
     {
       "source": "/((?!api/|assets/|.*\\..*).*)",
