@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import bundledFirebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
+import bundledSeedState from '../data/portal-state.json' with { type: 'json' };
 import { normalizeGoogleFormUrl } from '../src/utils/formUrl';
 import { calculateFinalScore } from '../src/utils/itemAnalysis';
 import type {
@@ -153,14 +154,24 @@ function normalizeParsedState(parsed: Partial<PortalState>): PortalState {
 
 function loadStateFromDisk(): PortalState {
   ensureDataDir();
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as Partial<PortalState>;
-      return normalizeParsedState(parsed);
+  const candidates = [
+    STATE_FILE,
+    path.resolve(process.cwd(), 'data', 'portal-state.json'),
+    path.resolve(CURRENT_DIR, '../data/portal-state.json'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        const raw = fs.readFileSync(candidate, 'utf-8');
+        const parsed = JSON.parse(raw) as Partial<PortalState>;
+        return normalizeParsedState(parsed);
+      }
+    } catch {
+      // Try next candidate
     }
-  } catch {
-    // Fallback to clean state
+  }
+  if (bundledSeedState && typeof bundledSeedState === 'object') {
+    return normalizeParsedState(bundledSeedState as Partial<PortalState>);
   }
   return { settings: { ...DEFAULT_SETTINGS }, exams: [], sessions: [], results: [] };
 }

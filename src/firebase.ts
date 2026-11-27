@@ -145,7 +145,7 @@ function formatGoogleAuthError(err: unknown): Error {
       return new Error('Permintaan login Google sebelumnya dibatalkan. Silakan coba klik sekali lagi.');
     case 'auth/unauthorized-domain':
       return new Error(
-        `Domain (${window.location.hostname}) belum diizinkan pada Firebase Authorized Domains. Tambahkan domain Vercel Anda di Firebase Console > Authentication > Settings > Authorized domains.`
+        `Login Google belum diaktifkan untuk domain (${window.location.hostname}). Anda tetap bisa langsung masuk Panel Guru memakai PIN Pengawas (default: 5555) tanpa perlu setting Firebase.`
       );
     case 'auth/operation-not-allowed':
       return new Error('Login Google belum diaktifkan pada proyek Firebase Auth.');
