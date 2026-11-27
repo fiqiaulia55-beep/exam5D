@@ -29,6 +29,7 @@ import {
   clearExamResultsFromFirestore,
   deleteExamResultFromFirestore,
   saveExamToFirestore,
+  syncExamResultsBatchToFirestore,
   upsertExamResultToFirestore,
 } from '../services/firebaseSync.ts';
 import {
@@ -219,9 +220,7 @@ export function ProctorAnalysisTab({
 
         if (firebaseUserUid) {
           await saveExamToFirestore(firebaseUserUid, nextExam, isPrimaryTeacher);
-          await Promise.all(
-            nextList.map((item) => upsertExamResultToFirestore(firebaseUserUid, item, isPrimaryTeacher))
-          );
+          await syncExamResultsBatchToFirestore(firebaseUserUid, nextList, isPrimaryTeacher);
         }
 
         onExamUpdated(nextExam);
@@ -447,9 +446,7 @@ function onFormSubmit(e) {
       const nextList = (data.results || examResults) as ExamStudentResult[];
       if (firebaseUserUid) {
         await saveExamToFirestore(firebaseUserUid, nextExam, isPrimaryTeacher);
-        await Promise.all(
-          nextList.map((item) => upsertExamResultToFirestore(firebaseUserUid, item, isPrimaryTeacher))
-        );
+        await syncExamResultsBatchToFirestore(firebaseUserUid, nextList, isPrimaryTeacher);
       }
       onExamUpdated(nextExam);
       onResultsUpdated(selectedExam.id, nextList);
@@ -504,9 +501,7 @@ function onFormSubmit(e) {
 
       if (firebaseUserUid) {
         await saveExamToFirestore(firebaseUserUid, nextExam, isPrimaryTeacher);
-        await Promise.all(
-          nextList.map((item) => upsertExamResultToFirestore(firebaseUserUid, item, isPrimaryTeacher))
-        );
+        await syncExamResultsBatchToFirestore(firebaseUserUid, nextList, isPrimaryTeacher);
       }
 
       onExamUpdated(nextExam);
@@ -561,9 +556,13 @@ function onFormSubmit(e) {
       const nextList = (data.results || []) as ExamStudentResult[];
       if (firebaseUserUid) {
         if (effectiveKey.length > 0) {
-          await saveExamToFirestore(firebaseUserUid, { ...selectedExam, answerKey: effectiveKey });
+          await saveExamToFirestore(
+            firebaseUserUid,
+            { ...selectedExam, answerKey: effectiveKey },
+            isPrimaryTeacher
+          );
         }
-        await Promise.all(nextList.map((item) => upsertExamResultToFirestore(firebaseUserUid, item)));
+        await syncExamResultsBatchToFirestore(firebaseUserUid, nextList, isPrimaryTeacher);
       }
 
       onResultsUpdated(selectedExam.id, nextList);
@@ -642,7 +641,7 @@ function onFormSubmit(e) {
             r.studentName.toLowerCase() === manualName.trim().toLowerCase()
         );
         if (savedItem) {
-          await upsertExamResultToFirestore(firebaseUserUid, savedItem);
+          await upsertExamResultToFirestore(firebaseUserUid, savedItem, isPrimaryTeacher);
         }
       }
 
@@ -677,7 +676,7 @@ function onFormSubmit(e) {
         if (resultId) {
           await deleteExamResultFromFirestore(selectedExam.id, resultId);
         } else {
-          await clearExamResultsFromFirestore(firebaseUserUid, selectedExam.id);
+          await clearExamResultsFromFirestore(firebaseUserUid, selectedExam.id, isPrimaryTeacher);
         }
       }
       onResultsUpdated(selectedExam.id, data.results || []);

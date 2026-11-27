@@ -20,6 +20,7 @@ import {
   FolderOpen,
   Download,
   Upload,
+  RefreshCw,
 } from 'lucide-react';
 import {
   collection,
@@ -49,14 +50,17 @@ import {
   OperationType,
   signInTeacherWithGoogle,
   signOutTeacher,
+  UnauthorizedDomainAuthError,
+  verifyFirestoreConnection,
 } from '../firebase.ts';
 import {
   deleteExamFromFirestore,
   getPortalConfigDocId,
   PRIMARY_TEACHER_EMAIL,
+  pullAllFirestoreData,
   saveExamToFirestore,
   savePortalConfigToFirestore,
-  upsertExamResultToFirestore,
+  syncExamResultsBatchToFirestore,
   upsertSessionToFirestore,
 } from '../services/firebaseSync.ts';
 import {
@@ -199,6 +203,9 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
   const authenticatedPinRef = useRef<string | null>(authenticatedPin);
   authenticatedPinRef.current = authenticatedPin;
   const [offerBasicGoogleFallback, setOfferBasicGoogleFallback] = useState(false);
+  const [unauthorizedDomainHost, setUnauthorizedDomainHost] = useState<string | null>(null);
+  const [copiedDomainHost, setCopiedDomainHost] = useState(false);
+  const [firebaseSyncingAll, setFirebaseSyncingAll] = useState(false);
   const [jsonBusy, setJsonBusy] = useState(false);
   const [jsonFeedback, setJsonFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(
     null
@@ -265,7 +272,7 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
         }
 
         for (const ex of serverExams) {
-          const sig = `${ex.updatedAt}::${ex.availabilityMode}::${ex.examTitle}`;
+          const sig = `${ex.updatedAt}::${ex.availabilityMode}::${ex.examTitle}::${ex.answerKey.length}`;
           if (!knownFirestoreExamIdsRef.current.has(ex.id) && syncedExamSigsRef.current[ex.id] !== sig) {
             syncedExamSigsRef.current[ex.id] = sig;
             const saved = await saveExamToFirestore(uid, ex, isPrimary, {
@@ -277,15 +284,18 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
           }
         }
 
-        for (const r of serverResults) {
-          if (!knownFirestoreExamIdsRef.current.has(r.examId)) continue;
+        const resultsToPush = serverResults.filter((r) => {
+          if (!knownFirestoreExamIdsRef.current.has(r.examId)) return false;
           const sig = `${r.source}::${r.rawScore}::${r.finalScore}::${r.submittedAt}::${r.itemScores.length}`;
-          if (syncedResultSigsRef.current[r.id] !== sig) {
-            syncedResultSigsRef.current[r.id] = sig;
-            await upsertExamResultToFirestore(uid, r, isPrimary, {
-              skipIfForeignOwned: true,
-            });
-          }
+          if (syncedResultSigsRef.current[r.id] === sig) return false;
+          syncedResultSigsRef.current[r.id] = sig;
+          return true;
+        });
+
+        if (resultsToPush.length > 0) {
+          await syncExamResultsBatchToFirestore(uid, resultsToPush, isPrimary, {
+            skipIfForeignOwned: true,
+          });
         }
 
         for (const s of serverSessions) {
@@ -457,14 +467,10 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
         const saved = await saveExamToFirestore(activeUid, nextExam, isPrimary, {
           skipIfForeignOwned: true,
         });
-        if (saved) {
-          await Promise.all(
-            nextList.map((item) =>
-              upsertExamResultToFirestore(activeUid, item, isPrimary, {
-                skipIfForeignOwned: true,
-              })
-            )
-          );
+        if (saved && nextList.length > 0) {
+          await syncExamResultsBatchToFirestore(activeUid, nextList, isPrimary, {
+            skipIfForeignOwned: true,
+          });
         }
       }
 
@@ -603,6 +609,7 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
             teacherName: String(d.teacherName || 'Guru Kelas 5D'),
             googleFormUrl: String(d.googleFormUrl || ''),
             googleFormId: String(d.googleFormId || ''),
+            googleSheetUrl: String(d.googleSheetUrl || ''),
             entryToken: String(d.entryToken || ''),
             submitToken: String(d.submitToken || 'KIRIM5D'),
             durationMinutes: Number(d.durationMinutes) || 60,
@@ -735,17 +742,97 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
     };
   }, [isOpen, authenticatedPin, verifiedUid, isPrimaryTeacher, examIdKey, reportSnapshotError]);
 
+  // Real-time Firestore listener for student sessions
+  useEffect(() => {
+    if (!isOpen || !authenticatedPin || !verifiedUid) return;
+    const sessPath = 'sessions';
+    const sessQuery = isPrimaryTeacher
+      ? collection(db, 'sessions')
+      : query(collection(db, 'sessions'), where('ownerUid', '==', verifiedUid));
+
+    const unsubSessions = onSnapshot(
+      sessQuery,
+      (snap) => {
+        const remoteSessions: StudentSession[] = snap.docs.map((docSnap) => {
+          const d = docSnap.data();
+          const vCount = Math.max(0, Number(d.violationCount) || 0);
+          const startedAt = Number(d.startedAt) || Date.now();
+          return {
+            id: docSnap.id,
+            examId: String(d.examId || ''),
+            examTitle: String(d.examTitle || ''),
+            subject: String(d.subject || ''),
+            studentName: String(d.studentName || ''),
+            absenNumber: String(d.absenNumber || '-'),
+            startedAt,
+            endsAt: Number(d.endsAt) || startedAt,
+            unlockAt: Number(d.unlockAt) || startedAt,
+            status: d.status === 'locked' || d.status === 'finished' ? d.status : 'active',
+            violations: Array.from({ length: vCount }, (_, idx) => ({
+              time: startedAt + idx * 1000,
+              reason: 'Pelanggaran fokus',
+              forgiven: d.status === 'active',
+            })),
+            lastHeartbeat: Number(d.finishedAt) || startedAt,
+            finishedAt: Number(d.finishedAt) || undefined,
+          };
+        });
+
+        if (remoteSessions.length > 0) {
+          setSessions((prev) => {
+            const byId = new Map(prev.map((s) => [s.id, s]));
+            for (const rs of remoteSessions) {
+              const cur = byId.get(rs.id);
+              if (
+                !cur ||
+                (rs.status === 'finished' && cur.status !== 'finished') ||
+                (rs.status === 'locked' && cur.status === 'active') ||
+                rs.violations.length > cur.violations.length
+              ) {
+                byId.set(rs.id, cur ? { ...cur, ...rs, violations: cur.violations.length >= rs.violations.length ? cur.violations : rs.violations } : rs);
+              }
+            }
+            return Array.from(byId.values());
+          });
+
+          void auth.currentUser
+            ?.getIdToken()
+            .catch(() => '')
+            .then((idToken) =>
+              fetch('/api/exams/hydrate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  currentPin: authenticatedPinRef.current || authenticatedPin,
+                  idToken: idToken || undefined,
+                  sessions: remoteSessions,
+                }),
+              })
+            )
+            .catch(() => {});
+        }
+      },
+      (error) => {
+        reportSnapshotError(error, OperationType.LIST, sessPath);
+      }
+    );
+
+    return () => unsubSessions();
+  }, [isOpen, authenticatedPin, verifiedUid, isPrimaryTeacher, reportSnapshotError]);
+
   if (!isOpen) return null;
 
   const handleGoogleSignIn = async (includeWorkspaceScopes = true): Promise<string | null> => {
     setFirebaseAuthBusy(true);
     setFirebaseNotice(null);
     setAuthError(null);
+    setUnauthorizedDomainHost(null);
     try {
       const { user, accessToken, workspaceWarning } = await signInTeacherWithGoogle(
         includeWorkspaceScopes
       );
       setOfferBasicGoogleFallback(false);
+      setUnauthorizedDomainHost(null);
       setWorkspaceToken(accessToken);
       if (!authenticatedPin && user.emailVerified) {
         const unlocked = await unlockPanelWithGoogleUser(user);
@@ -761,6 +848,9 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
       }
       return accessToken;
     } catch (err) {
+      if (err instanceof UnauthorizedDomainAuthError) {
+        setUnauthorizedDomainHost(err.hostname);
+      }
       const msg = formatFirebaseNoticeError(err, 'Login Google dibatalkan atau gagal.');
       setFirebaseNotice(msg);
       if (includeWorkspaceScopes) {
@@ -772,6 +862,75 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
       return null;
     } finally {
       setFirebaseAuthBusy(false);
+    }
+  };
+
+  const handlePullAllFromFirebase = async () => {
+    if (!verifiedUid || !authenticatedPin) return;
+    setFirebaseSyncingAll(true);
+    setFirebaseNotice(null);
+    try {
+      const conn = await verifyFirestoreConnection();
+      if (!conn.ok) {
+        throw new Error(conn.error || 'Firestore sedang offline.');
+      }
+
+      const [snapshot, idToken] = await Promise.all([
+        pullAllFirestoreData(verifiedUid, teacherEmail, isPrimaryTeacher),
+        auth.currentUser?.getIdToken().catch(() => ''),
+      ]);
+
+      const res = await fetch('/api/exams/hydrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPin: authenticatedPin,
+          idToken: idToken || undefined,
+          settings: snapshot.settings,
+          exams: snapshot.exams,
+          results: snapshot.results,
+          sessions: snapshot.sessions,
+        }),
+      });
+      const hydrated = await res.json();
+      if (!res.ok) {
+        throw new Error(hydrated.error || 'Gagal menyinkronkan data dari Firestore.');
+      }
+
+      const nextSettings = (hydrated.settings || portalSettings) as PortalSettings;
+      const nextExams = (hydrated.exams || exams) as ExamItem[];
+      const nextResults = (hydrated.results || results) as ExamStudentResult[];
+      const nextSessions = (hydrated.sessions || sessions) as StudentSession[];
+
+      setPortalSettings(nextSettings);
+      setExams(nextExams);
+      setResults(nextResults);
+      setSessions(nextSessions);
+      if (nextSettings?.proctorPin) {
+        setAuthenticatedPin(nextSettings.proctorPin);
+      }
+      onConfigUpdated();
+
+      await pushServerUpdatesToFirestore(
+        verifiedUid,
+        teacherEmail,
+        isPrimaryTeacher,
+        nextSettings,
+        nextExams,
+        nextResults,
+        nextSessions
+      );
+
+      setFeedback({
+        type: 'ok',
+        text: `Sinkronisasi Firebase lengkap berhasil: ${nextExams.length} jadwal ulangan, ${nextResults.length} nilai siswa, dan ${nextSessions.length} sesi aktif tersinkron.`,
+      });
+    } catch (err) {
+      setFirebaseNotice(
+        formatFirebaseNoticeError(err, 'Gagal menarik semua data dari Firebase Firestore.')
+      );
+    } finally {
+      setFirebaseSyncingAll(false);
     }
   };
 
@@ -961,7 +1120,7 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
     if (res.ok) {
       if (verifiedUid) {
         knownFirestoreExamIdsRef.current.delete(examId);
-        await deleteExamFromFirestore(verifiedUid, examId);
+        await deleteExamFromFirestore(verifiedUid, examId, isPrimaryTeacher);
       }
       setExams(data.exams || []);
       onConfigUpdated();
@@ -1173,8 +1332,8 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
             skipIfForeignOwned: true,
           }).catch(() => {});
         }
-        for (const r of nextResults) {
-          void upsertExamResultToFirestore(verifiedUid, r, isPrimaryTeacher, {
+        if (nextResults.length > 0) {
+          void syncExamResultsBatchToFirestore(verifiedUid, nextResults, isPrimaryTeacher, {
             skipIfForeignOwned: true,
           }).catch(() => {});
         }
@@ -1254,6 +1413,39 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
               </div>
 
               {authError && <p className="mt-3 text-xs font-medium text-red-600">{authError}</p>}
+
+              {unauthorizedDomainHost && (
+                <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-950">
+                  <p className="font-semibold">
+                    Aktifkan Login Google &amp; Firebase untuk Vercel:
+                  </p>
+                  <p className="mt-1">
+                    Tambahkan domain <code className="font-mono font-bold">{unauthorizedDomainHost}</code> ke Firebase Authorized Domains.
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(unauthorizedDomainHost).catch(() => {});
+                        setCopiedDomainHost(true);
+                        window.setTimeout(() => setCopiedDomainHost(false), 2000);
+                      }}
+                      className="rounded border border-amber-300 bg-white px-2.5 py-1 font-semibold text-amber-900 hover:bg-amber-100"
+                    >
+                      {copiedDomainHost ? 'Domain Disalin!' : `Salin ${unauthorizedDomainHost}`}
+                    </button>
+                    <a
+                      href="https://console.firebase.google.com/project/gen-lang-client-0342477582/authentication/settings"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 rounded bg-amber-900 px-2.5 py-1 font-semibold text-white hover:bg-amber-800"
+                    >
+                      Buka Firebase Console
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </div>
+                </div>
+              )}
 
               <button
                 type="submit"
@@ -1391,11 +1583,21 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
 
               <div className="flex flex-wrap items-center gap-2">
                 {verifiedUid ? (
-                  <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-900">
+                  <div className="inline-flex flex-wrap items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-900">
                     <Cloud className="h-3.5 w-3.5 text-emerald-700" />
                     <span className="max-w-[160px] truncate font-medium">
                       {firebaseUser?.email}
                     </span>
+                    <button
+                      type="button"
+                      disabled={firebaseSyncingAll}
+                      onClick={handlePullAllFromFirebase}
+                      className="inline-flex items-center gap-1 font-semibold text-emerald-800 hover:underline disabled:opacity-60"
+                      title="Tarik dan sinkronkan seluruh jadwal, nilai, dan sesi dengan Firebase Firestore"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${firebaseSyncingAll ? 'animate-spin' : ''}`} />
+                      {firebaseSyncingAll ? 'Menyinkron...' : 'Tarik Semua Firebase'}
+                    </button>
                     {!workspaceToken && (
                       <button
                         type="button"
@@ -1465,15 +1667,28 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
             </div>
 
             {firebaseNotice && (
-              <div className="flex items-center justify-between gap-2 border-b border-red-200 bg-red-50 px-6 py-2 text-xs font-medium text-red-800">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-red-200 bg-red-50 px-6 py-2 text-xs font-medium text-red-800">
                 <span>{firebaseNotice}</span>
-                <button
-                  type="button"
-                  onClick={() => setFirebaseNotice(null)}
-                  className="font-semibold underline"
-                >
-                  Tutup
-                </button>
+                <div className="flex items-center gap-2">
+                  {unauthorizedDomainHost && (
+                    <a
+                      href="https://console.firebase.google.com/project/gen-lang-client-0342477582/authentication/settings"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 rounded bg-red-800 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-red-900"
+                    >
+                      Tambahkan Domain di Firebase Console
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setFirebaseNotice(null)}
+                    className="font-semibold underline"
+                  >
+                    Tutup
+                  </button>
+                </div>
               </div>
             )}
 

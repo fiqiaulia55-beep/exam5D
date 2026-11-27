@@ -89,7 +89,7 @@ service cloud.firestore {
           'questionCount', 'kkm', 'webhookSecret', 'answerKey', 'createdAt', 'updatedAt'
         ]) &&
         data.keys().hasOnly([
-          'id', 'ownerUid', 'examTitle', 'subject', 'teacherName', 'googleFormUrl', 'googleFormId',
+          'id', 'ownerUid', 'examTitle', 'subject', 'teacherName', 'googleFormUrl', 'googleFormId', 'googleSheetUrl',
           'entryToken', 'submitToken', 'durationMinutes', 'lockSubmitMinutes',
           'enableSubmitToken', 'enableBottomOverlayGuard', 'maxViolationsBeforeLock',
           'availabilityMode', 'scheduledStart', 'scheduledEnd', 'maxRawScore',
@@ -102,6 +102,7 @@ service cloud.firestore {
         data.teacherName is string && data.teacherName.size() >= 1 && data.teacherName.size() <= 120 &&
         data.googleFormUrl is string && data.googleFormUrl.size() <= 1000 &&
         (!('googleFormId' in data) || (data.googleFormId is string && data.googleFormId.size() <= 128)) &&
+        (!('googleSheetUrl' in data) || (data.googleSheetUrl is string && data.googleSheetUrl.size() <= 1000)) &&
         data.entryToken is string && data.entryToken.size() >= 1 && data.entryToken.size() <= 40 &&
         data.submitToken is string && data.submitToken.size() >= 1 && data.submitToken.size() <= 40 &&
         (data.durationMinutes is int || data.durationMinutes is float) && data.durationMinutes >= 1 && data.durationMinutes <= 240 &&
@@ -253,7 +254,7 @@ service cloud.firestore {
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly([
-          'examTitle', 'subject', 'teacherName', 'googleFormUrl', 'googleFormId',
+          'examTitle', 'subject', 'teacherName', 'googleFormUrl', 'googleFormId', 'googleSheetUrl',
           'entryToken', 'submitToken', 'durationMinutes', 'lockSubmitMinutes',
           'enableSubmitToken', 'enableBottomOverlayGuard', 'maxViolationsBeforeLock',
           'availabilityMode', 'scheduledStart', 'scheduledEnd', 'maxRawScore',

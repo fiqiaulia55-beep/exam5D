@@ -2269,11 +2269,15 @@ function createApp() {
     next();
   });
   app2.get("/api/health", (_req, res) => {
+    const cfg = loadFirebaseConfig();
     res.json({
       ok: true,
       vercel: IS_VERCEL,
       hasKv: Boolean(KV_URL && KV_TOKEN),
-      examCount: state.exams.length
+      examCount: state.exams.length,
+      resultCount: state.results.length,
+      firebaseProjectId: cfg.projectId || null,
+      firestoreDatabaseId: cfg.firestoreDatabaseId || null
     });
   });
   app2.get("/api/exam/public", (_req, res) => {
@@ -2530,8 +2534,36 @@ function createApp() {
       );
       if (idx < 0) {
         state.results.push(r);
-      } else if (state.results[idx].source === "kiosk" && r.source !== "kiosk") {
-        state.results[idx] = r;
+      } else {
+        const cur = state.results[idx];
+        const incomingHasBetterData = r.source !== "kiosk" && (cur.source === "kiosk" || (Number(r.submittedAt) || 0) > (Number(cur.submittedAt) || 0) || (Array.isArray(r.itemScores) ? r.itemScores.length : 0) > (Array.isArray(cur.itemScores) ? cur.itemScores.length : 0) || Number(r.rawScore) > 0 && Number(cur.rawScore) === 0);
+        if (incomingHasBetterData) {
+          state.results[idx] = { ...r, id: cur.id };
+        }
+      }
+    }
+    const incomingSessions = Array.isArray(req.body?.sessions) ? req.body.sessions : [];
+    for (const s of incomingSessions) {
+      if (!s?.id || !s?.examId) continue;
+      const incomingViolations = Array.isArray(s.violations) ? s.violations : [];
+      const idx = state.sessions.findIndex((existing) => existing.id === s.id);
+      if (idx < 0) {
+        state.sessions.push({
+          ...s,
+          violations: incomingViolations
+        });
+      } else {
+        const cur = state.sessions[idx];
+        const curViolations = Array.isArray(cur.violations) ? cur.violations : [];
+        const remoteFinished = s.status === "finished" && cur.status !== "finished";
+        const remoteLocked = s.status === "locked" && cur.status === "active";
+        if (remoteFinished || remoteLocked || (s.lastHeartbeat || 0) > (cur.lastHeartbeat || 0)) {
+          state.sessions[idx] = {
+            ...cur,
+            ...s,
+            violations: incomingViolations.length >= curViolations.length ? incomingViolations : curViolations
+          };
+        }
       }
     }
     await saveState();
@@ -2539,6 +2571,7 @@ function createApp() {
     res.json({
       settings: state.settings,
       exams: state.exams,
+      sessions: state.sessions,
       results: state.results,
       publicPayload: {
         settings: {

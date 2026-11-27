@@ -111,23 +111,38 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-async function testConnection(): Promise<void> {
+export async function verifyFirestoreConnection(): Promise<{ ok: boolean; error?: string }> {
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
+    return { ok: true };
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');
+      return { ok: false, error: 'Koneksi ke server Firestore sedang offline.' };
     }
+    return { ok: true };
   }
 }
 
-void testConnection();
+void verifyFirestoreConnection();
 
 function getAuthErrorCode(err: unknown): string {
   if (err && typeof err === 'object' && 'code' in err) {
     return String((err as { code?: unknown }).code || '');
   }
   return '';
+}
+
+export class UnauthorizedDomainAuthError extends Error {
+  hostname: string;
+  constructor(hostname: string) {
+    super(
+      `Domain (${hostname}) belum ditambahkan ke Firebase Authorized Domains. Tambahkan "${hostname}" di Firebase Console > Authentication > Settings > Authorized domains agar Login Google & sinkronisasi Firebase aktif di Vercel.`
+    );
+    this.name = 'UnauthorizedDomainAuthError';
+    this.hostname = hostname;
+  }
 }
 
 function formatGoogleAuthError(err: unknown): Error {
@@ -144,8 +159,8 @@ function formatGoogleAuthError(err: unknown): Error {
     case 'auth/cancelled-popup-request':
       return new Error('Permintaan login Google sebelumnya dibatalkan. Silakan coba klik sekali lagi.');
     case 'auth/unauthorized-domain':
-      return new Error(
-        `Login Google belum diaktifkan untuk domain (${window.location.hostname}). Anda tetap bisa langsung masuk Panel Guru memakai PIN Pengawas (default: 5555) tanpa perlu setting Firebase.`
+      return new UnauthorizedDomainAuthError(
+        typeof window !== 'undefined' ? window.location.hostname : 'domain ini'
       );
     case 'auth/operation-not-allowed':
       return new Error('Login Google belum diaktifkan pada proyek Firebase Auth.');
