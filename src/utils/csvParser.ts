@@ -78,6 +78,71 @@ function parseScoreString(val: string): number | null {
   return Number.isFinite(num) ? num : null;
 }
 
+function normalizeAnswerText(val: string): string {
+  return val.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function stripOptionPrefix(val: string): string {
+  return val.replace(/^[a-e]\s*[.):\-]\s*/i, '').trim();
+}
+
+export function matchesAnswerText(studentAnswer: string, rawKey: string): boolean {
+  const ans = normalizeAnswerText(studentAnswer);
+  if (!ans || !rawKey.trim()) return false;
+
+  const acceptableKeys = rawKey
+    .split(/\s*\/\s*|\s*\|\s*/)
+    .map(normalizeAnswerText)
+    .filter(Boolean);
+
+  for (const key of acceptableKeys) {
+    if (ans === key) return true;
+
+    if (
+      key.length === 1 &&
+      /^[a-e]$/.test(key) &&
+      (ans.startsWith(`${key}.`) ||
+        ans.startsWith(`${key})`) ||
+        ans.startsWith(`${key} -`) ||
+        ans.startsWith(`${key}:`) ||
+        ans.startsWith(`${key} `))
+    ) {
+      return true;
+    }
+
+    const strippedKey = stripOptionPrefix(key);
+    const strippedAns = stripOptionPrefix(ans);
+    if (strippedKey && strippedAns && strippedKey === strippedAns) {
+      return true;
+    }
+
+    const numKey = Number(key.replace(',', '.'));
+    const numAns = Number(ans.replace(',', '.'));
+    if (
+      !Number.isNaN(numKey) &&
+      !Number.isNaN(numAns) &&
+      key !== '' &&
+      ans !== '' &&
+      numKey === numAns
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function parseAnswerKeyText(rawText: string): string[] {
+  const trimmed = rawText.trim();
+  if (!trimmed) return [];
+  const tokens = trimmed.includes('\n') || trimmed.includes(';') || trimmed.includes(',')
+    ? trimmed.split(/[\n;,]+/)
+    : trimmed.split(/\s+/);
+  return tokens
+    .map((entry) => entry.replace(/^\d+\s*[.):\-]\s*/, '').trim())
+    .filter(Boolean);
+}
+
 export function parseGoogleFormCsv(
   csvText: string,
   questionCount: number,
@@ -106,7 +171,13 @@ export function parseGoogleFormCsv(
     (h) => h.includes('nama') || h.includes('name')
   );
   const absenIdx = lowerHeaders.findIndex(
-    (h) => h.includes('absen') || h.includes('no.') || h === 'no' || h.includes('nomor')
+    (h) =>
+      h.includes('absen') ||
+      h.includes('no.') ||
+      h === 'no' ||
+      h.startsWith('no ') ||
+      h.includes('nomor urut') ||
+      h.includes('no urut')
   );
 
   // Detect per-item "[Score]" or "[Skor]" columns (exported by Google Forms Quiz CSV)
@@ -115,7 +186,15 @@ export function parseGoogleFormCsv(
 
   lowerHeaders.forEach((h, idx) => {
     if (idx === timestampIdx || idx === scoreIdx || idx === nameIdx || idx === absenIdx) return;
-    if (h.includes('email') || h.includes('token kirim') || h.includes('kelas')) return;
+    if (
+      h.includes('email') ||
+      h.includes('token') ||
+      h.includes('kelas') ||
+      h.includes('nisn') ||
+      h === 'nis'
+    ) {
+      return;
+    }
 
     if (h.includes('[score]') || h.includes('[skor]')) {
       itemScoreIndices.push(idx);
@@ -128,8 +207,7 @@ export function parseGoogleFormCsv(
   const effectiveCols = hasPerItemScoreColumns ? itemScoreIndices : questionIndices;
   const detectedQuestions = Math.min(questionCount, effectiveCols.length);
 
-  const normalizedKey = answerKey.map((k) => k.trim().toLowerCase());
-  const hasAnswerKey = normalizedKey.some((k) => k !== '');
+  const hasAnswerKey = answerKey.some((k) => k.trim() !== '');
 
   const parsedRows: ParsedCsvRow[] = [];
 
@@ -138,7 +216,7 @@ export function parseGoogleFormCsv(
     const studentName =
       nameIdx >= 0 && line[nameIdx] ? line[nameIdx] : `Siswa ${r}`;
     const absenNumber =
-      absenIdx >= 0 && line[absenIdx] ? line[absenIdx] : String(r);
+      absenIdx >= 0 && line[absenIdx] ? line[absenIdx] : '-';
 
     const submittedAt =
       timestampIdx >= 0 && line[timestampIdx] && !Number.isNaN(Date.parse(line[timestampIdx]))
@@ -155,14 +233,9 @@ export function parseGoogleFormCsv(
       });
     } else if (hasAnswerKey) {
       itemScores = answers.map((ans, qIdx) => {
-        const key = normalizedKey[qIdx] ?? '';
-        if (!key) return 0;
-        const cleanAns = ans.trim().toLowerCase();
-        // Match exact answer OR leading choice letter like "A. ..." matching key "A"
-        if (cleanAns === key) return 1;
-        if (key.length === 1 && cleanAns.startsWith(`${key}.`)) return 1;
-        if (key.length === 1 && cleanAns.startsWith(`${key})`)) return 1;
-        return 0;
+        const key = answerKey[qIdx] ?? '';
+        if (!key.trim()) return 0;
+        return matchesAnswerText(ans, key) ? 1 : 0;
       });
     }
 

@@ -18,6 +18,8 @@ import {
   Cloud,
   LogOut,
   FolderOpen,
+  Download,
+  Upload,
 } from 'lucide-react';
 import {
   collection,
@@ -197,6 +199,11 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
   const authenticatedPinRef = useRef<string | null>(authenticatedPin);
   authenticatedPinRef.current = authenticatedPin;
   const [offerBasicGoogleFallback, setOfferBasicGoogleFallback] = useState(false);
+  const [jsonBusy, setJsonBusy] = useState(false);
+  const [jsonFeedback, setJsonFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(
+    null
+  );
+  const jsonFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
@@ -1083,6 +1090,111 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
     window.setTimeout(() => setCopiedLink(false), 2000);
   };
 
+  const handleExportJsonDatabase = async () => {
+    if (!authenticatedPin) return;
+    setJsonBusy(true);
+    setJsonFeedback(null);
+    try {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
+      const res = await fetch('/api/portal/export-json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPin: authenticatedPin,
+          idToken: idToken || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Gagal mengunduh database JSON.');
+      }
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `portal-cbt-5d-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setJsonFeedback({
+        type: 'ok',
+        text: `Database JSON berhasil diunduh (${(data.exams || []).length} jadwal ulangan, ${(data.results || []).length} data nilai).`,
+      });
+    } catch (err) {
+      setJsonFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Gagal mengekspor database JSON.',
+      });
+    } finally {
+      setJsonBusy(false);
+    }
+  };
+
+  const handleImportJsonDatabase = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !authenticatedPin) return;
+    setJsonBusy(true);
+    setJsonFeedback(null);
+    try {
+      const rawText = await file.text();
+      const parsedJson = JSON.parse(rawText);
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
+      const res = await fetch('/api/portal/import-json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPin: authenticatedPin,
+          idToken: idToken || undefined,
+          data: parsedJson,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Gagal memuat file database JSON.');
+      }
+
+      const nextSettings = data.settings as PortalSettings;
+      const nextExams = (data.exams || []) as ExamItem[];
+      const nextResults = (data.results || []) as ExamStudentResult[];
+      setPortalSettings(nextSettings);
+      setExams(nextExams);
+      setSessions(data.sessions || []);
+      setResults(nextResults);
+      if (nextSettings?.proctorPin) {
+        setAuthenticatedPin(nextSettings.proctorPin);
+      }
+      onConfigUpdated();
+
+      if (verifiedUid) {
+        void savePortalConfigToFirestore(verifiedUid, nextSettings, teacherEmail).catch(() => {});
+        for (const ex of nextExams) {
+          void saveExamToFirestore(verifiedUid, ex, isPrimaryTeacher, {
+            skipIfForeignOwned: true,
+          }).catch(() => {});
+        }
+        for (const r of nextResults) {
+          void upsertExamResultToFirestore(verifiedUid, r, isPrimaryTeacher, {
+            skipIfForeignOwned: true,
+          }).catch(() => {});
+        }
+      }
+
+      setJsonFeedback({
+        type: 'ok',
+        text: `Database JSON berhasil dimuat: ${nextExams.length} jadwal ulangan dan ${nextResults.length} nilai siswa aktif sekarang.`,
+      });
+    } catch (err) {
+      setJsonFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'File JSON tidak valid atau gagal diproses.',
+      });
+    } finally {
+      setJsonBusy(false);
+      e.target.value = '';
+    }
+  };
+
   const urlCheck = editingExam?.googleFormUrl
     ? normalizeGoogleFormUrl(editingExam.googleFormUrl)
     : null;
@@ -1273,7 +1385,7 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Kelas &amp; PIN
+                  Kelas, PIN &amp; JSON
                 </button>
               </div>
 
@@ -2025,71 +2137,130 @@ export function ProctorPanel({ isOpen, onClose, onConfigUpdated }: ProctorPanelP
               )}
 
               {panelTab === 'portal' && (
-                <form onSubmit={handleSavePortalSettings} className="max-w-lg space-y-5">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700">
-                      Nama Kelas
-                    </label>
-                    <input
-                      type="text"
-                      value={portalSettings.className}
-                      onChange={(e) =>
-                        setPortalSettings({ ...portalSettings, className: e.target.value })
-                      }
-                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:border-sky-600 focus:outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700">
-                      Nama Wali Kelas / Guru Default
-                    </label>
-                    <input
-                      type="text"
-                      value={portalSettings.defaultTeacherName}
-                      onChange={(e) =>
-                        setPortalSettings({
-                          ...portalSettings,
-                          defaultTeacherName: e.target.value,
-                        })
-                      }
-                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:border-sky-600 focus:outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700">
-                      PIN Pengawas (Minimal 4 Karakter)
-                    </label>
-                    <input
-                      type="text"
-                      value={portalSettings.proctorPin}
-                      onChange={(e) =>
-                        setPortalSettings({ ...portalSettings, proctorPin: e.target.value })
-                      }
-                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm focus:border-sky-600 focus:outline-none"
-                    />
-                  </div>
-
-                  {feedback && (
-                    <div
-                      className={`flex items-start gap-2.5 rounded-lg border px-4 py-3 text-xs font-medium ${
-                        feedback.type === 'ok'
-                          ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
-                          : 'border-red-200 bg-red-50 text-red-900'
-                      }`}
-                    >
-                      <span>{feedback.text}</span>
+                <div className="space-y-8">
+                  <form onSubmit={handleSavePortalSettings} className="max-w-lg space-y-5">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700">
+                        Nama Kelas
+                      </label>
+                      <input
+                        type="text"
+                        value={portalSettings.className}
+                        onChange={(e) =>
+                          setPortalSettings({ ...portalSettings, className: e.target.value })
+                        }
+                        className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:border-sky-600 focus:outline-none"
+                      />
                     </div>
-                  )}
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700">
+                        Nama Wali Kelas / Guru Default
+                      </label>
+                      <input
+                        type="text"
+                        value={portalSettings.defaultTeacherName}
+                        onChange={(e) =>
+                          setPortalSettings({
+                            ...portalSettings,
+                            defaultTeacherName: e.target.value,
+                          })
+                        }
+                        className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:border-sky-600 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700">
+                        PIN Pengawas (Minimal 4 Karakter)
+                      </label>
+                      <input
+                        type="text"
+                        value={portalSettings.proctorPin}
+                        onChange={(e) =>
+                          setPortalSettings({ ...portalSettings, proctorPin: e.target.value })
+                        }
+                        className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm focus:border-sky-600 focus:outline-none"
+                      />
+                    </div>
 
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
-                  >
-                    <Save className="h-4 w-4" />
-                    {saving ? 'Menyimpan...' : 'Simpan Pengaturan Kelas'}
-                  </button>
-                </form>
+                    {feedback && (
+                      <div
+                        className={`flex items-start gap-2.5 rounded-lg border px-4 py-3 text-xs font-medium ${
+                          feedback.type === 'ok'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                            : 'border-red-200 bg-red-50 text-red-900'
+                        }`}
+                      >
+                        <span>{feedback.text}</span>
+                      </div>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={saving}
+                      className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                    >
+                      <Save className="h-4 w-4" />
+                      {saving ? 'Menyimpan...' : 'Simpan Pengaturan Kelas'}
+                    </button>
+                  </form>
+
+                  <div className="max-w-2xl rounded-xl border border-slate-200 bg-slate-50/70 p-5">
+                    <h4 className="text-sm font-bold text-slate-900">
+                      Database JSON (Backup &amp; Sinkronisasi)
+                    </h4>
+                    <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                      Seluruh jadwal ulangan, token, kunci jawaban, sesi siswa, dan nilai akhir
+                      disimpan dalam format JSON. Unduh file backup JSON untuk dipindahkan antar
+                      perangkat atau dimuat ulang kapan saja di Vercel tanpa perlu setting Firebase.
+                    </p>
+
+                    <div className="mt-4 flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        disabled={jsonBusy}
+                        onClick={handleExportJsonDatabase}
+                        className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-xs font-semibold text-white hover:bg-sky-700 disabled:opacity-60"
+                      >
+                        <Download className="h-4 w-4" />
+                        {jsonBusy ? 'Memproses...' : 'Download Database JSON'}
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={jsonBusy}
+                        onClick={() => jsonFileInputRef.current?.click()}
+                        className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                      >
+                        <Upload className="h-4 w-4" />
+                        Muat / Restore Database JSON
+                      </button>
+                      <input
+                        ref={jsonFileInputRef}
+                        type="file"
+                        accept=".json,application/json"
+                        onChange={handleImportJsonDatabase}
+                        className="hidden"
+                      />
+                    </div>
+
+                    {jsonFeedback && (
+                      <div
+                        className={`mt-4 flex items-start gap-2 rounded-lg border px-3.5 py-2.5 text-xs font-medium ${
+                          jsonFeedback.type === 'ok'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                            : 'border-red-200 bg-red-50 text-red-900'
+                        }`}
+                      >
+                        {jsonFeedback.type === 'ok' ? (
+                          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
+                        ) : (
+                          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                        )}
+                        <span>{jsonFeedback.text}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
               )}
 
               {panelTab === 'analysis' && (

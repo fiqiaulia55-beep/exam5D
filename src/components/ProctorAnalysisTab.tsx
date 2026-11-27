@@ -13,6 +13,8 @@ import {
   Pencil,
   RefreshCw,
   KeyRound,
+  Link2,
+  Save,
 } from 'lucide-react';
 import type { ExamItem, ExamStudentResult, StudentSession } from '../types.ts';
 import {
@@ -20,7 +22,7 @@ import {
   computeClassStats,
   computeItemAnalysis,
 } from '../utils/itemAnalysis.ts';
-import { parseGoogleFormCsv } from '../utils/csvParser.ts';
+import { parseAnswerKeyText, parseGoogleFormCsv } from '../utils/csvParser.ts';
 import { exportExamAnalysisDocx } from '../utils/exportWord.ts';
 import { auth, clearWorkspaceAccessToken } from '../firebase.ts';
 import {
@@ -80,12 +82,17 @@ export function ProctorAnalysisTab({
   const [showWebhookScript, setShowWebhookScript] = useState(false);
   const [copiedScript, setCopiedScript] = useState(false);
 
-  // Google Forms API direct sync state
+  // Google Forms API & Google Sheet direct sync state
   const [syncingGoogleForm, setSyncingGoogleForm] = useState(false);
+  const [sheetUrlInput, setSheetUrlInput] = useState(selectedExam?.googleSheetUrl || '');
+  const [syncingSheet, setSyncingSheet] = useState(false);
+  const [savingKey, setSavingKey] = useState(false);
   const [showDetectedKey, setShowDetectedKey] = useState(false);
 
   // CSV Import & Answer Key state
-  const [answerKeyText, setAnswerKeyText] = useState('');
+  const [answerKeyText, setAnswerKeyText] = useState(
+    () => (selectedExam?.answerKey || []).join(', ')
+  );
   const [importing, setImporting] = useState(false);
   const [importMessage, setImportMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(
     null
@@ -100,6 +107,11 @@ export function ProctorAnalysisTab({
   const [exportingDocx, setExportingDocx] = useState(false);
 
   const lastAutoSyncSignatureRef = useRef<string>('');
+
+  useEffect(() => {
+    setSheetUrlInput(selectedExam?.googleSheetUrl || '');
+    setAnswerKeyText((selectedExam?.answerKey || []).join(', '));
+  }, [selectedExam?.id]);
 
   const examResults = useMemo(() => {
     if (!selectedExam) return [];
@@ -164,10 +176,7 @@ export function ProctorAnalysisTab({
       if (!options?.silent) setImportMessage(null);
 
       try {
-        const manualFallbackKey = answerKeyText
-          .split(/[\s,;]+/)
-          .map((k) => k.trim())
-          .filter(Boolean);
+        const manualFallbackKey = parseAnswerKeyText(answerKeyText);
 
         const graded = await fetchAndGradeGoogleFormResponses({
           accessToken: token,
@@ -287,33 +296,66 @@ export function ProctorAnalysisTab({
   const webhookUrl = `${origin}/api/webhook/form-response/${selectedExam.id}`;
   const activeKeyCount = (selectedExam.answerKey || []).filter((k) => k.trim() !== '').length;
 
-  const appsScriptSnippet = `function onFormSubmit(e) {
-  var itemResponses = e.response.getItemResponses();
+  const appsScriptSnippet = `var PORTAL_WEBHOOK = "${webhookUrl}";
+var PORTAL_SECRET = "${selectedExam.webhookSecret}";
+
+function extractFormKey_(form) {
+  var keys = [];
+  var items = form.getItems();
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    var title = (item.getTitle() || "").toLowerCase();
+    if (title.indexOf("nama") !== -1 || title.indexOf("absen") !== -1 || title.indexOf("token") !== -1 || title.indexOf("kelas") !== -1) {
+      continue;
+    }
+    var ans = "";
+    var t = item.getType();
+    if (t === FormApp.ItemType.MULTIPLE_CHOICE) {
+      var choices = item.asMultipleChoiceItem().getChoices();
+      for (var c = 0; c < choices.length; c++) {
+        if (choices[c].isCorrectAnswer()) { ans = choices[c].getValue(); break; }
+      }
+    } else if (t === FormApp.ItemType.LIST) {
+      var lChoices = item.asListItem().getChoices();
+      for (var c = 0; c < lChoices.length; c++) {
+        if (lChoices[c].isCorrectAnswer()) { ans = lChoices[c].getValue(); break; }
+      }
+    } else if (t === FormApp.ItemType.CHECKBOX) {
+      var cbChoices = item.asCheckboxItem().getChoices();
+      var correctList = [];
+      for (var c = 0; c < cbChoices.length; c++) {
+        if (cbChoices[c].isCorrectAnswer()) correctList.push(cbChoices[c].getValue());
+      }
+      ans = correctList.join(" | ");
+    }
+    keys.push(ans);
+  }
+  return keys;
+}
+
+function parseSingleResponse_(response) {
+  var itemResponses = response.getItemResponses();
   var studentName = "";
   var absenNumber = "";
   var itemScores = [];
   var answers = [];
   var totalScore = 0;
 
-  // Cek apakah form mode Kuis memiliki method getScore()
-  var gradable = (typeof e.response.getGradableItemResponses === "function")
-    ? e.response.getGradableItemResponses()
+  var gradable = (typeof response.getGradableItemResponses === "function")
+    ? response.getGradableItemResponses()
     : [];
-
   var scoreMap = {};
   for (var g = 0; g < gradable.length; g++) {
     var gr = gradable[g];
-    var itemId = String(gr.getItem().getId());
-    var sc = Number(gr.getScore() || 0);
-    scoreMap[itemId] = sc;
+    scoreMap[String(gr.getItem().getId())] = Number(gr.getScore() || 0);
   }
 
   for (var i = 0; i < itemResponses.length; i++) {
     var ir = itemResponses[i];
     var qId = String(ir.getItem().getId());
-    var qTitle = ir.getItem().getTitle();
-    var lower = qTitle.toLowerCase();
-    var ans = String(ir.getResponse() || "");
+    var lower = (ir.getItem().getTitle() || "").toLowerCase();
+    var rawResp = ir.getResponse();
+    var ans = Array.isArray(rawResp) ? rawResp.join(" | ") : String(rawResp || "");
 
     if (lower.indexOf("nama") !== -1 && !studentName && !(qId in scoreMap)) {
       studentName = ans;
@@ -327,19 +369,50 @@ export function ProctorAnalysisTab({
     }
   }
 
-  var payload = {
-    secret: "${selectedExam.webhookSecret}",
+  return {
     studentName: studentName || "Siswa",
     absenNumber: absenNumber || "-",
     rawScore: totalScore,
     itemScores: itemScores,
-    answers: answers
+    answers: answers,
+    submittedAt: response.getTimestamp().getTime()
   };
+}
 
-  UrlFetchApp.fetch("${webhookUrl}", {
+// 1. Jalankan fungsi ini langsung dari Editor Apps Script untuk mengirim semua nilai & kunci yang sudah ada
+function sinkronSemuaKePortal() {
+  var form = FormApp.getActiveForm();
+  var responses = form.getResponses();
+  var batch = [];
+  for (var r = 0; r < responses.length; r++) {
+    batch.push(parseSingleResponse_(responses[r]));
+  }
+  UrlFetchApp.fetch(PORTAL_WEBHOOK, {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify(payload),
+    payload: JSON.stringify({
+      secret: PORTAL_SECRET,
+      answerKey: extractFormKey_(form),
+      batch: batch
+    }),
+    muteHttpExceptions: true
+  });
+}
+
+// 2. Pasang Trigger "Saat mengirim formulir" agar nilai siswa baru masuk otomatis real-time
+function onFormSubmit(e) {
+  var row = parseSingleResponse_(e.response);
+  UrlFetchApp.fetch(PORTAL_WEBHOOK, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      secret: PORTAL_SECRET,
+      studentName: row.studentName,
+      absenNumber: row.absenNumber,
+      rawScore: row.rawScore,
+      itemScores: row.itemScores,
+      answers: row.answers
+    }),
     muteHttpExceptions: true
   });
 }`;
@@ -350,6 +423,108 @@ export function ProctorAnalysisTab({
     window.setTimeout(() => setCopiedScript(false), 2000);
   };
 
+  const handleSaveAnswerKey = async () => {
+    if (!selectedExam) return;
+    setSavingKey(true);
+    setImportMessage(null);
+    try {
+      const parsedKey = parseAnswerKeyText(answerKeyText);
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
+      const res = await fetch(`/api/exams/${selectedExam.id}/answer-key`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPin: authenticatedPin,
+          idToken: idToken || undefined,
+          answerKey: parsedKey,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Gagal menyimpan kunci jawaban.');
+      }
+      const nextExam = (data.exam as ExamItem) || { ...selectedExam, answerKey: parsedKey };
+      const nextList = (data.results || examResults) as ExamStudentResult[];
+      if (firebaseUserUid) {
+        await saveExamToFirestore(firebaseUserUid, nextExam, isPrimaryTeacher);
+        await Promise.all(
+          nextList.map((item) => upsertExamResultToFirestore(firebaseUserUid, item, isPrimaryTeacher))
+        );
+      }
+      onExamUpdated(nextExam);
+      onResultsUpdated(selectedExam.id, nextList);
+      setImportMessage({
+        type: 'ok',
+        text: `Kunci jawaban (${parsedKey.length} butir) tersimpan ke database JSON dan nilai siswa dihitung ulang otomatis.`,
+      });
+    } catch (err) {
+      setImportMessage({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Gagal menyimpan kunci jawaban.',
+      });
+    } finally {
+      setSavingKey(false);
+    }
+  };
+
+  const handleSyncFromGoogleSheet = async () => {
+    if (!selectedExam) return;
+    if (!sheetUrlInput.trim()) {
+      setImportMessage({
+        type: 'err',
+        text: 'Tempelkan link Google Sheet respon Google Form terlebih dahulu.',
+      });
+      return;
+    }
+    setSyncingSheet(true);
+    setImportMessage(null);
+    try {
+      const parsedKey = parseAnswerKeyText(answerKeyText);
+      const idToken = await auth.currentUser?.getIdToken().catch(() => '');
+      const res = await fetch(`/api/exams/${selectedExam.id}/results/sync-sheet`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPin: authenticatedPin,
+          idToken: idToken || undefined,
+          googleSheetUrl: sheetUrlInput.trim(),
+          answerKey: parsedKey.length > 0 ? parsedKey : undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Gagal menarik respon dari Google Sheet.');
+      }
+
+      const nextExam = (data.exam as ExamItem) || {
+        ...selectedExam,
+        googleSheetUrl: sheetUrlInput.trim(),
+      };
+      const nextList = (data.results || []) as ExamStudentResult[];
+
+      if (firebaseUserUid) {
+        await saveExamToFirestore(firebaseUserUid, nextExam, isPrimaryTeacher);
+        await Promise.all(
+          nextList.map((item) => upsertExamResultToFirestore(firebaseUserUid, item, isPrimaryTeacher))
+        );
+      }
+
+      onExamUpdated(nextExam);
+      onResultsUpdated(selectedExam.id, nextList);
+      setImportMessage({
+        type: 'ok',
+        text: `Berhasil menarik ${data.syncedCount} respon siswa dari Google Sheet (${data.detectedQuestions} kolom soal terbaca). Nilai Akhir otomatis dihitung dengan rumus (Skor ÷ ${selectedExam.maxRawScore || 40}) × 100.`,
+      });
+    } catch (err) {
+      setImportMessage({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Gagal membaca Google Sheet respon.',
+      });
+    } finally {
+      setSyncingSheet(false);
+    }
+  };
+
   const handleCsvUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -357,10 +532,7 @@ export function ProctorAnalysisTab({
     setImportMessage(null);
     try {
       const text = await file.text();
-      const parsedKey = answerKeyText
-        .split(/[\s,;]+/)
-        .map((k) => k.trim())
-        .filter(Boolean);
+      const parsedKey = parseAnswerKeyText(answerKeyText);
       const effectiveKey = parsedKey.length > 0 ? parsedKey : selectedExam.answerKey || [];
 
       const parsed = parseGoogleFormCsv(text, questionCount, effectiveKey);
@@ -625,14 +797,43 @@ export function ProctorAnalysisTab({
           </button>
         </div>
 
-        {/* Detected Answer Key from Google Form */}
+        {/* Direct Google Sheet Respon Sync (No OAuth / No Firebase Domain needed) */}
+        <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/70 p-3.5">
+          <label htmlFor="googleSheetUrlInput" className="block text-xs font-semibold text-slate-800">
+            Hubungkan Link Google Sheet Respon Form (Alternatif tanpa Login Google / tanpa Setting Firebase)
+          </label>
+          <p className="mt-0.5 text-[11px] text-slate-500">
+            Di Google Form tab Jawaban klik ikon Spreadsheet &rarr; Bagikan &ldquo;Siapa saja yang memiliki link dapat melihat&rdquo;, lalu tempel linknya di sini.
+          </p>
+          <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+            <input
+              id="googleSheetUrlInput"
+              type="url"
+              placeholder="https://docs.google.com/spreadsheets/d/.../edit"
+              value={sheetUrlInput}
+              onChange={(e) => setSheetUrlInput(e.target.value)}
+              className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-800 placeholder:text-slate-400 focus:border-sky-600 focus:outline-none"
+            />
+            <button
+              type="button"
+              disabled={syncingSheet}
+              onClick={handleSyncFromGoogleSheet}
+              className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60 whitespace-nowrap"
+            >
+              <Link2 className="h-3.5 w-3.5" />
+              {syncingSheet ? 'Menarik Sheet...' : 'Tarik Nilai Sheet'}
+            </button>
+          </div>
+        </div>
+
+        {/* Detected Answer Key from Google Form / JSON */}
         {activeKeyCount > 0 && (
           <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50/70 px-4 py-3 text-xs text-emerald-950">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 font-semibold">
                 <KeyRound className="h-4 w-4 text-emerald-700" />
                 <span>
-                  Kunci Jawaban Terbaca dari Google Form: {activeKeyCount} butir soal aktif
+                  Kunci Jawaban Aktif: {activeKeyCount} butir soal
                 </span>
               </div>
               <button
@@ -655,20 +856,30 @@ export function ProctorAnalysisTab({
           </div>
         )}
 
-        {/* Optional Answer Key override/fallback */}
+        {/* Answer Key Input + Direct Save */}
         <div className="mt-4">
           <label htmlFor="answerKeyInput" className="block text-xs font-medium text-slate-700">
-            Kunci Jawaban Tambahan Opsional (hanya jika ada soal tanpa kunci di Google Form / CSV
-            non-kuis)
+            Kunci Jawaban Manual / Cadangan (pisahkan dengan koma, misal: A, C, B, D atau 1. A, 2. C)
           </label>
-          <input
-            id="answerKeyInput"
-            type="text"
-            placeholder="Kosongkan jika kunci jawaban sudah disetel di Google Form (Mode Kuis)"
-            value={answerKeyText}
-            onChange={(e) => setAnswerKeyText(e.target.value)}
-            className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-sky-600 focus:outline-none"
-          />
+          <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
+            <input
+              id="answerKeyInput"
+              type="text"
+              placeholder="Kosongkan jika kunci jawaban sudah otomatis terbaca dari Google Form (Mode Kuis)"
+              value={answerKeyText}
+              onChange={(e) => setAnswerKeyText(e.target.value)}
+              className="flex-1 rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-sky-600 focus:outline-none"
+            />
+            <button
+              type="button"
+              disabled={savingKey}
+              onClick={handleSaveAnswerKey}
+              className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap"
+            >
+              <Save className="h-3.5 w-3.5" />
+              {savingKey ? 'Menyimpan...' : 'Simpan Kunci & Hitung'}
+            </button>
+          </div>
         </div>
 
         {showWebhookScript && (

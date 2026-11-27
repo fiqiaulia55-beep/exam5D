@@ -1776,6 +1776,171 @@ function calculateFinalScore(rawScore, maxRawScore = 40) {
   return Math.round(score * 100) / 100;
 }
 
+// src/utils/csvParser.ts
+function parseCsvMatrix(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        cell += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cell += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ",") {
+        row.push(cell.trim());
+        cell = "";
+      } else if (ch === "\r" && next === "\n") {
+        row.push(cell.trim());
+        rows.push(row);
+        row = [];
+        cell = "";
+        i++;
+      } else if (ch === "\n" || ch === "\r") {
+        row.push(cell.trim());
+        rows.push(row);
+        row = [];
+        cell = "";
+      } else {
+        cell += ch;
+      }
+    }
+  }
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell.trim());
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((c) => c !== ""));
+}
+function parseScoreString(val) {
+  if (!val) return null;
+  const slashMatch = val.match(/^(\d+(?:[.,]\d+)?)\s*\/\s*\d+(?:[.,]\d+)?$/);
+  if (slashMatch) {
+    return Number(slashMatch[1].replace(",", "."));
+  }
+  const num = Number(val.replace(",", "."));
+  return Number.isFinite(num) ? num : null;
+}
+function normalizeAnswerText(val) {
+  return val.trim().toLowerCase().replace(/\s+/g, " ");
+}
+function stripOptionPrefix(val) {
+  return val.replace(/^[a-e]\s*[.):\-]\s*/i, "").trim();
+}
+function matchesAnswerText(studentAnswer, rawKey) {
+  const ans = normalizeAnswerText(studentAnswer);
+  if (!ans || !rawKey.trim()) return false;
+  const acceptableKeys = rawKey.split(/\s*\/\s*|\s*\|\s*/).map(normalizeAnswerText).filter(Boolean);
+  for (const key of acceptableKeys) {
+    if (ans === key) return true;
+    if (key.length === 1 && /^[a-e]$/.test(key) && (ans.startsWith(`${key}.`) || ans.startsWith(`${key})`) || ans.startsWith(`${key} -`) || ans.startsWith(`${key}:`) || ans.startsWith(`${key} `))) {
+      return true;
+    }
+    const strippedKey = stripOptionPrefix(key);
+    const strippedAns = stripOptionPrefix(ans);
+    if (strippedKey && strippedAns && strippedKey === strippedAns) {
+      return true;
+    }
+    const numKey = Number(key.replace(",", "."));
+    const numAns = Number(ans.replace(",", "."));
+    if (!Number.isNaN(numKey) && !Number.isNaN(numAns) && key !== "" && ans !== "" && numKey === numAns) {
+      return true;
+    }
+  }
+  return false;
+}
+function parseGoogleFormCsv(csvText, questionCount, answerKey = []) {
+  const matrix = parseCsvMatrix(csvText);
+  if (matrix.length < 2) {
+    return {
+      rows: [],
+      detectedQuestions: 0,
+      hasScoreColumn: false,
+      hasPerItemScoreColumns: false
+    };
+  }
+  const headers = matrix[0];
+  const lowerHeaders = headers.map((h) => h.toLowerCase());
+  const timestampIdx = lowerHeaders.findIndex(
+    (h) => h.includes("timestamp") || h.includes("cap waktu") || h.includes("waktu")
+  );
+  const scoreIdx = lowerHeaders.findIndex(
+    (h) => h === "score" || h === "skor" || h.includes("total score") || h.includes("skor total")
+  );
+  const nameIdx = lowerHeaders.findIndex(
+    (h) => h.includes("nama") || h.includes("name")
+  );
+  const absenIdx = lowerHeaders.findIndex(
+    (h) => h.includes("absen") || h.includes("no.") || h === "no" || h.startsWith("no ") || h.includes("nomor urut") || h.includes("no urut")
+  );
+  const itemScoreIndices = [];
+  const questionIndices = [];
+  lowerHeaders.forEach((h, idx) => {
+    if (idx === timestampIdx || idx === scoreIdx || idx === nameIdx || idx === absenIdx) return;
+    if (h.includes("email") || h.includes("token") || h.includes("kelas") || h.includes("nisn") || h === "nis") {
+      return;
+    }
+    if (h.includes("[score]") || h.includes("[skor]")) {
+      itemScoreIndices.push(idx);
+    } else if (!h.includes("[feedback]") && !h.includes("[masukan]")) {
+      questionIndices.push(idx);
+    }
+  });
+  const hasPerItemScoreColumns = itemScoreIndices.length > 0;
+  const effectiveCols = hasPerItemScoreColumns ? itemScoreIndices : questionIndices;
+  const detectedQuestions = Math.min(questionCount, effectiveCols.length);
+  const hasAnswerKey = answerKey.some((k) => k.trim() !== "");
+  const parsedRows = [];
+  for (let r = 1; r < matrix.length; r++) {
+    const line = matrix[r];
+    const studentName = nameIdx >= 0 && line[nameIdx] ? line[nameIdx] : `Siswa ${r}`;
+    const absenNumber = absenIdx >= 0 && line[absenIdx] ? line[absenIdx] : "-";
+    const submittedAt = timestampIdx >= 0 && line[timestampIdx] && !Number.isNaN(Date.parse(line[timestampIdx])) ? Date.parse(line[timestampIdx]) : Date.now();
+    const answers = questionIndices.slice(0, questionCount).map((idx) => line[idx] ?? "");
+    let itemScores = [];
+    if (hasPerItemScoreColumns) {
+      itemScores = itemScoreIndices.slice(0, questionCount).map((idx) => {
+        const s = parseScoreString(line[idx] ?? "");
+        return s !== null && s > 0 ? 1 : 0;
+      });
+    } else if (hasAnswerKey) {
+      itemScores = answers.map((ans, qIdx) => {
+        const key = answerKey[qIdx] ?? "";
+        if (!key.trim()) return 0;
+        return matchesAnswerText(ans, key) ? 1 : 0;
+      });
+    }
+    let rawScore = scoreIdx >= 0 ? parseScoreString(line[scoreIdx] ?? "") : null;
+    if (rawScore === null && itemScores.length > 0) {
+      rawScore = itemScores.reduce((acc, v) => acc + v, 0);
+    }
+    parsedRows.push({
+      studentName,
+      absenNumber,
+      rawScore,
+      itemScores,
+      answers,
+      submittedAt
+    });
+  }
+  return {
+    rows: parsedRows,
+    detectedQuestions,
+    hasScoreColumn: scoreIdx >= 0,
+    hasPerItemScoreColumns
+  };
+}
+
 // server/app.ts
 dotenv.config();
 var CURRENT_DIR = (() => {
@@ -1844,6 +2009,7 @@ function normalizeExamRecord(raw) {
     teacherName: raw.teacherName || DEFAULT_SETTINGS.defaultTeacherName,
     googleFormUrl: raw.googleFormUrl || "",
     googleFormId: raw.googleFormId || "",
+    googleSheetUrl: raw.googleSheetUrl || "",
     entryToken: raw.entryToken || "",
     submitToken: raw.submitToken || "KIRIM5D",
     durationMinutes: Number(raw.durationMinutes) || 60,
@@ -2286,6 +2452,51 @@ function createApp() {
     await saveState();
     res.json({ settings: state.settings });
   });
+  app.post("/api/portal/export-json", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: "PIN Pengawas atau sesi Google tidak valid." });
+      return;
+    }
+    res.json({
+      version: 1,
+      exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      settings: state.settings,
+      exams: state.exams,
+      sessions: state.sessions,
+      results: state.results
+    });
+  });
+  app.post("/api/portal/import-json", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: "PIN Pengawas atau sesi Google tidak valid." });
+      return;
+    }
+    const payload = req.body?.data;
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.exams) && !payload.settings) {
+      res.status(400).json({ error: "Format file JSON database tidak valid." });
+      return;
+    }
+    const nextState = normalizeParsedState(payload);
+    state = nextState;
+    await saveState();
+    const now = Date.now();
+    res.json({
+      settings: state.settings,
+      exams: state.exams,
+      sessions: state.sessions.slice().sort((a, b) => b.startedAt - a.startedAt),
+      results: state.results.slice().sort((a, b) => b.submittedAt - a.submittedAt),
+      publicPayload: {
+        settings: {
+          className: state.settings.className,
+          defaultTeacherName: state.settings.defaultTeacherName
+        },
+        exams: state.exams.map((ex) => toPublicExam(ex, now)),
+        serverTime: now
+      }
+    });
+  });
   app.post("/api/exams/hydrate", async (req, res) => {
     const authorized = await isAuthorizedTeacherRequest(req);
     if (!authorized) {
@@ -2417,6 +2628,7 @@ function createApp() {
       teacherName: String(incoming.teacherName ?? "").trim() || state.settings.defaultTeacherName,
       googleFormUrl: normalized ? normalized.embedUrl : "",
       googleFormId: String(incoming.googleFormId ?? prev?.googleFormId ?? "").trim(),
+      googleSheetUrl: String(incoming.googleSheetUrl ?? prev?.googleSheetUrl ?? "").trim(),
       entryToken,
       submitToken: String(incoming.submitToken ?? "").trim().toUpperCase() || "KIRIM5D",
       durationMinutes,
@@ -2562,6 +2774,143 @@ function createApp() {
     await saveState();
     res.json({ results: state.results.filter((r) => r.examId === req.params.examId) });
   });
+  function gradeAnswersWithKey(answers, answerKey, questionCount) {
+    const limit = Math.min(questionCount, Math.max(answers.length, answerKey.length));
+    const itemScores = [];
+    for (let i = 0; i < limit; i++) {
+      const key = (answerKey[i] ?? "").trim();
+      const ans = answers[i] ?? "";
+      itemScores.push(key && matchesAnswerText(ans, key) ? 1 : 0);
+    }
+    const rawScore = itemScores.reduce((acc, v) => acc + v, 0);
+    return { itemScores, rawScore };
+  }
+  app.post("/api/exams/:examId/answer-key", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: "PIN Pengawas atau sesi Google tidak valid." });
+      return;
+    }
+    const exam = state.exams.find((ex) => ex.id === req.params.examId);
+    if (!exam) {
+      res.status(404).json({ error: "Ulangan tidak ditemukan." });
+      return;
+    }
+    const keyList = Array.isArray(req.body?.answerKey) ? req.body.answerKey.map((k) => String(k ?? "").trim()).slice(0, 100) : [];
+    exam.answerKey = keyList;
+    exam.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    if (keyList.some((k) => k !== "")) {
+      state.results = state.results.map((r) => {
+        if (r.examId !== exam.id || !r.answers || r.answers.length === 0) return r;
+        const graded = gradeAnswersWithKey(r.answers, keyList, exam.questionCount || 40);
+        return {
+          ...r,
+          itemScores: graded.itemScores,
+          rawScore: graded.rawScore,
+          finalScore: calculateFinalScore(graded.rawScore, exam.maxRawScore || 40)
+        };
+      });
+    }
+    await saveState();
+    res.json({
+      exam,
+      exams: state.exams,
+      results: state.results.filter((r) => r.examId === exam.id)
+    });
+  });
+  app.post("/api/exams/:examId/results/sync-sheet", async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: "PIN Pengawas atau sesi Google tidak valid." });
+      return;
+    }
+    const exam = state.exams.find((ex) => ex.id === req.params.examId);
+    if (!exam) {
+      res.status(404).json({ error: "Ulangan tidak ditemukan." });
+      return;
+    }
+    const rawSheetUrl = String(req.body?.googleSheetUrl ?? exam.googleSheetUrl ?? "").trim();
+    if (!rawSheetUrl) {
+      res.status(400).json({ error: "Masukkan link Google Sheet respon Google Form terlebih dahulu." });
+      return;
+    }
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(/^https?:\/\//i.test(rawSheetUrl) ? rawSheetUrl : `https://${rawSheetUrl}`);
+    } catch {
+      res.status(400).json({ error: "Format link Google Sheet tidak valid." });
+      return;
+    }
+    if (parsedUrl.protocol !== "https:" || parsedUrl.hostname.toLowerCase() !== "docs.google.com" || !parsedUrl.pathname.startsWith("/spreadsheets/")) {
+      res.status(400).json({
+        error: "Hanya link resmi https://docs.google.com/spreadsheets/... yang diizinkan."
+      });
+      return;
+    }
+    const gid = parsedUrl.searchParams.get("gid") || "";
+    const pubMatch = parsedUrl.pathname.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9_-]+)/);
+    const directMatch = parsedUrl.pathname.match(/\/spreadsheets\/d\/(?!e\/)([a-zA-Z0-9_-]+)/);
+    let csvExportUrl = "";
+    if (pubMatch) {
+      csvExportUrl = `https://docs.google.com/spreadsheets/d/e/${pubMatch[1]}/pub?output=csv${gid ? `&gid=${encodeURIComponent(gid)}` : ""}`;
+    } else if (directMatch) {
+      csvExportUrl = `https://docs.google.com/spreadsheets/d/${directMatch[1]}/export?format=csv${gid ? `&gid=${encodeURIComponent(gid)}` : ""}`;
+    } else {
+      res.status(400).json({ error: "ID Google Spreadsheet tidak terbaca dari link tersebut." });
+      return;
+    }
+    let csvText = "";
+    try {
+      const sheetRes = await fetch(csvExportUrl, { method: "GET", redirect: "follow" });
+      csvText = await sheetRes.text();
+      const lower = csvText.trim().slice(0, 300).toLowerCase();
+      if (!sheetRes.ok || lower.startsWith("<!doctype html") || lower.startsWith("<html") || sheetRes.url.includes("accounts.google.com")) {
+        res.status(400).json({
+          error: 'Google Sheet respon belum bisa diakses publik. Di Google Sheet respon Form, klik Bagikan > Ubah akses ke "Siapa saja yang memiliki link dapat melihat" (atau File > Bagikan > Publikasikan ke web), lalu coba tarik ulang.'
+        });
+        return;
+      }
+    } catch {
+      res.status(502).json({ error: "Gagal menghubungi Google Spreadsheet." });
+      return;
+    }
+    const providedKey = Array.isArray(req.body?.answerKey) ? req.body.answerKey.map((k) => String(k ?? "").trim()).filter(Boolean) : [];
+    const effectiveKey = providedKey.length > 0 ? providedKey : exam.answerKey || [];
+    const parsed = parseGoogleFormCsv(csvText, exam.questionCount || 40, effectiveKey);
+    if (parsed.rows.length === 0) {
+      res.status(400).json({
+        error: "Spreadsheet berhasil dibuka, namun belum ada baris respon siswa yang terbaca."
+      });
+      return;
+    }
+    exam.googleSheetUrl = rawSheetUrl;
+    if (providedKey.length > 0) {
+      exam.answerKey = providedKey;
+    }
+    exam.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    for (const row of parsed.rows) {
+      const itemScores = Array.isArray(row.itemScores) ? row.itemScores.map((v) => Number(v) > 0 ? 1 : 0) : [];
+      const rawScore = row.rawScore !== null && row.rawScore !== void 0 ? Number(row.rawScore) : itemScores.reduce((acc, v) => acc + v, 0);
+      upsertStudentResult(exam, {
+        studentName: row.studentName,
+        absenNumber: row.absenNumber,
+        rawScore,
+        itemScores,
+        answers: row.answers,
+        submittedAt: row.submittedAt,
+        source: "google_forms"
+      });
+    }
+    await saveState();
+    res.json({
+      exam,
+      exams: state.exams,
+      results: state.results.filter((r) => r.examId === exam.id),
+      syncedCount: parsed.rows.length,
+      detectedQuestions: parsed.detectedQuestions,
+      hasScoreColumn: parsed.hasScoreColumn
+    });
+  });
   app.post("/api/webhook/form-response/:examId", async (req, res) => {
     const exam = state.exams.find((ex) => ex.id === req.params.examId);
     if (!exam) {
@@ -2575,15 +2924,60 @@ function createApp() {
       res.status(401).json({ error: "Secret webhook tidak valid." });
       return;
     }
+    if (Array.isArray(req.body?.answerKey) && req.body.answerKey.length > 0) {
+      exam.answerKey = req.body.answerKey.map((k) => String(k ?? "").trim()).slice(0, 100);
+      exam.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    }
+    const batchRows = Array.isArray(req.body?.batch) ? req.body.batch : null;
+    const hasExamKey = (exam.answerKey || []).some((k) => k.trim() !== "");
+    if (batchRows) {
+      let synced = 0;
+      for (const row of batchRows) {
+        const sName = String(row?.studentName ?? "").trim();
+        if (!sName) continue;
+        const sAbsen = String(row?.absenNumber ?? "").trim() || "-";
+        let itemScores2 = Array.isArray(row?.itemScores) ? row.itemScores.map((v) => Number(v) > 0 ? 1 : 0) : [];
+        const answers2 = Array.isArray(row?.answers) ? row.answers.map(String) : void 0;
+        let rawScore2 = row?.rawScore !== void 0 && row?.rawScore !== null ? Number(row.rawScore) : itemScores2.reduce((acc, v) => acc + v, 0);
+        if (rawScore2 === 0 && !itemScores2.some((v) => v > 0) && answers2 && answers2.length > 0 && hasExamKey) {
+          const graded = gradeAnswersWithKey(answers2, exam.answerKey, exam.questionCount || 40);
+          itemScores2 = graded.itemScores;
+          rawScore2 = graded.rawScore;
+        }
+        upsertStudentResult(exam, {
+          studentName: sName,
+          absenNumber: sAbsen,
+          rawScore: rawScore2,
+          itemScores: itemScores2,
+          answers: answers2,
+          submittedAt: Number(row?.submittedAt) || Date.now(),
+          source: "google_forms"
+        });
+        synced++;
+      }
+      await saveState();
+      res.json({ ok: true, synced });
+      return;
+    }
     const studentName = String(req.body?.studentName ?? "").trim();
     const absenNumber = String(req.body?.absenNumber ?? "").trim();
     if (!studentName) {
+      if (Array.isArray(req.body?.answerKey)) {
+        await saveState();
+        res.json({ ok: true, answerKey: exam.answerKey });
+        return;
+      }
       res.status(400).json({ error: "studentName wajib dikirim." });
       return;
     }
-    const itemScores = Array.isArray(req.body?.itemScores) ? req.body.itemScores.map((v) => Number(v) > 0 ? 1 : 0) : [];
+    let itemScores = Array.isArray(req.body?.itemScores) ? req.body.itemScores.map((v) => Number(v) > 0 ? 1 : 0) : [];
     const answers = Array.isArray(req.body?.answers) ? req.body.answers.map(String) : void 0;
-    const rawScore = req.body?.rawScore !== void 0 && req.body?.rawScore !== null ? Number(req.body.rawScore) : itemScores.reduce((acc, v) => acc + v, 0);
+    let rawScore = req.body?.rawScore !== void 0 && req.body?.rawScore !== null ? Number(req.body.rawScore) : itemScores.reduce((acc, v) => acc + v, 0);
+    if (rawScore === 0 && !itemScores.some((v) => v > 0) && answers && answers.length > 0 && hasExamKey) {
+      const graded = gradeAnswersWithKey(answers, exam.answerKey, exam.questionCount || 40);
+      itemScores = graded.itemScores;
+      rawScore = graded.rawScore;
+    }
     const saved = upsertStudentResult(exam, {
       studentName,
       absenNumber: absenNumber || "-",

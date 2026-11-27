@@ -8,6 +8,7 @@ import bundledFirebaseConfig from '../firebase-applet-config.json' with { type: 
 import bundledSeedState from '../data/portal-state.json' with { type: 'json' };
 import { normalizeGoogleFormUrl } from '../src/utils/formUrl';
 import { calculateFinalScore } from '../src/utils/itemAnalysis';
+import { matchesAnswerText, parseGoogleFormCsv } from '../src/utils/csvParser';
 import type {
   ExamComputedStatus,
   ExamItem,
@@ -124,6 +125,7 @@ function normalizeExamRecord(raw: Partial<ExamItem>): ExamItem {
     teacherName: raw.teacherName || DEFAULT_SETTINGS.defaultTeacherName,
     googleFormUrl: raw.googleFormUrl || '',
     googleFormId: raw.googleFormId || '',
+    googleSheetUrl: raw.googleSheetUrl || '',
     entryToken: raw.entryToken || '',
     submitToken: raw.submitToken || 'KIRIM5D',
     durationMinutes: Number(raw.durationMinutes) || 60,
@@ -668,6 +670,57 @@ export function createApp() {
     res.json({ settings: state.settings });
   });
 
+  // Export entire JSON portal database (settings, exams, sessions, results) - Proctor only
+  app.post('/api/portal/export-json', async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: 'PIN Pengawas atau sesi Google tidak valid.' });
+      return;
+    }
+    res.json({
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settings: state.settings,
+      exams: state.exams,
+      sessions: state.sessions,
+      results: state.results,
+    });
+  });
+
+  // Import/restore entire JSON portal database - Proctor only
+  app.post('/api/portal/import-json', async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: 'PIN Pengawas atau sesi Google tidak valid.' });
+      return;
+    }
+    const payload = req.body?.data as Partial<PortalState> | undefined;
+    if (!payload || typeof payload !== 'object' || (!Array.isArray(payload.exams) && !payload.settings)) {
+      res.status(400).json({ error: 'Format file JSON database tidak valid.' });
+      return;
+    }
+
+    const nextState = normalizeParsedState(payload);
+    state = nextState;
+    await saveState();
+
+    const now = Date.now();
+    res.json({
+      settings: state.settings,
+      exams: state.exams,
+      sessions: state.sessions.slice().sort((a, b) => b.startedAt - a.startedAt),
+      results: state.results.slice().sort((a, b) => b.submittedAt - a.submittedAt),
+      publicPayload: {
+        settings: {
+          className: state.settings.className,
+          defaultTeacherName: state.settings.defaultTeacherName,
+        },
+        exams: state.exams.map((ex) => toPublicExam(ex, now)),
+        serverTime: now,
+      },
+    });
+  });
+
   // Hydrate server runtime state from Firebase Firestore (Proctor PIN or verified Teacher token)
   app.post('/api/exams/hydrate', async (req, res) => {
     const authorized = await isAuthorizedTeacherRequest(req);
@@ -838,6 +891,7 @@ export function createApp() {
         String(incoming.teacherName ?? '').trim() || state.settings.defaultTeacherName,
       googleFormUrl: normalized ? normalized.embedUrl : '',
       googleFormId: String(incoming.googleFormId ?? prev?.googleFormId ?? '').trim(),
+      googleSheetUrl: String(incoming.googleSheetUrl ?? prev?.googleSheetUrl ?? '').trim(),
       entryToken,
       submitToken:
         String(incoming.submitToken ?? '').trim().toUpperCase() || 'KIRIM5D',
@@ -1024,7 +1078,184 @@ export function createApp() {
     res.json({ results: state.results.filter((r) => r.examId === req.params.examId) });
   });
 
-  // Real-time Webhook for Google Form Apps Script onFormSubmit (authenticated by per-exam webhookSecret)
+  function gradeAnswersWithKey(
+    answers: string[],
+    answerKey: string[],
+    questionCount: number
+  ): { itemScores: number[]; rawScore: number } {
+    const limit = Math.min(questionCount, Math.max(answers.length, answerKey.length));
+    const itemScores: number[] = [];
+    for (let i = 0; i < limit; i++) {
+      const key = (answerKey[i] ?? '').trim();
+      const ans = answers[i] ?? '';
+      itemScores.push(key && matchesAnswerText(ans, key) ? 1 : 0);
+    }
+    const rawScore = itemScores.reduce((acc, v) => acc + v, 0);
+    return { itemScores, rawScore };
+  }
+
+  // Save answer key directly to JSON database (and regrade stored answers)
+  app.post('/api/exams/:examId/answer-key', async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: 'PIN Pengawas atau sesi Google tidak valid.' });
+      return;
+    }
+    const exam = state.exams.find((ex) => ex.id === req.params.examId);
+    if (!exam) {
+      res.status(404).json({ error: 'Ulangan tidak ditemukan.' });
+      return;
+    }
+    const keyList = Array.isArray(req.body?.answerKey)
+      ? req.body.answerKey.map((k: unknown) => String(k ?? '').trim()).slice(0, 100)
+      : [];
+    exam.answerKey = keyList;
+    exam.updatedAt = new Date().toISOString();
+
+    if (keyList.some((k: string) => k !== '')) {
+      state.results = state.results.map((r) => {
+        if (r.examId !== exam.id || !r.answers || r.answers.length === 0) return r;
+        const graded = gradeAnswersWithKey(r.answers, keyList, exam.questionCount || 40);
+        return {
+          ...r,
+          itemScores: graded.itemScores,
+          rawScore: graded.rawScore,
+          finalScore: calculateFinalScore(graded.rawScore, exam.maxRawScore || 40),
+        };
+      });
+    }
+
+    await saveState();
+    res.json({
+      exam,
+      exams: state.exams,
+      results: state.results.filter((r) => r.examId === exam.id),
+    });
+  });
+
+  // SSRF-safe Google Sheets CSV sync for Google Form responses (works on Vercel without OAuth/Firebase setup)
+  app.post('/api/exams/:examId/results/sync-sheet', async (req, res) => {
+    const authorized = await isAuthorizedTeacherRequest(req);
+    if (!authorized) {
+      res.status(401).json({ error: 'PIN Pengawas atau sesi Google tidak valid.' });
+      return;
+    }
+    const exam = state.exams.find((ex) => ex.id === req.params.examId);
+    if (!exam) {
+      res.status(404).json({ error: 'Ulangan tidak ditemukan.' });
+      return;
+    }
+
+    const rawSheetUrl = String(req.body?.googleSheetUrl ?? exam.googleSheetUrl ?? '').trim();
+    if (!rawSheetUrl) {
+      res.status(400).json({ error: 'Masukkan link Google Sheet respon Google Form terlebih dahulu.' });
+      return;
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(/^https?:\/\//i.test(rawSheetUrl) ? rawSheetUrl : `https://${rawSheetUrl}`);
+    } catch {
+      res.status(400).json({ error: 'Format link Google Sheet tidak valid.' });
+      return;
+    }
+    if (
+      parsedUrl.protocol !== 'https:' ||
+      parsedUrl.hostname.toLowerCase() !== 'docs.google.com' ||
+      !parsedUrl.pathname.startsWith('/spreadsheets/')
+    ) {
+      res.status(400).json({
+        error: 'Hanya link resmi https://docs.google.com/spreadsheets/... yang diizinkan.',
+      });
+      return;
+    }
+
+    const gid = parsedUrl.searchParams.get('gid') || '';
+    const pubMatch = parsedUrl.pathname.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9_-]+)/);
+    const directMatch = parsedUrl.pathname.match(/\/spreadsheets\/d\/(?!e\/)([a-zA-Z0-9_-]+)/);
+    let csvExportUrl = '';
+    if (pubMatch) {
+      csvExportUrl = `https://docs.google.com/spreadsheets/d/e/${pubMatch[1]}/pub?output=csv${gid ? `&gid=${encodeURIComponent(gid)}` : ''}`;
+    } else if (directMatch) {
+      csvExportUrl = `https://docs.google.com/spreadsheets/d/${directMatch[1]}/export?format=csv${gid ? `&gid=${encodeURIComponent(gid)}` : ''}`;
+    } else {
+      res.status(400).json({ error: 'ID Google Spreadsheet tidak terbaca dari link tersebut.' });
+      return;
+    }
+
+    let csvText = '';
+    try {
+      const sheetRes = await fetch(csvExportUrl, { method: 'GET', redirect: 'follow' });
+      csvText = await sheetRes.text();
+      const lower = csvText.trim().slice(0, 300).toLowerCase();
+      if (
+        !sheetRes.ok ||
+        lower.startsWith('<!doctype html') ||
+        lower.startsWith('<html') ||
+        sheetRes.url.includes('accounts.google.com')
+      ) {
+        res.status(400).json({
+          error:
+            'Google Sheet respon belum bisa diakses publik. Di Google Sheet respon Form, klik Bagikan > Ubah akses ke "Siapa saja yang memiliki link dapat melihat" (atau File > Bagikan > Publikasikan ke web), lalu coba tarik ulang.',
+        });
+        return;
+      }
+    } catch {
+      res.status(502).json({ error: 'Gagal menghubungi Google Spreadsheet.' });
+      return;
+    }
+
+    const providedKey = Array.isArray(req.body?.answerKey)
+      ? req.body.answerKey.map((k: unknown) => String(k ?? '').trim()).filter(Boolean)
+      : [];
+    const effectiveKey = providedKey.length > 0 ? providedKey : exam.answerKey || [];
+
+    const parsed = parseGoogleFormCsv(csvText, exam.questionCount || 40, effectiveKey);
+    if (parsed.rows.length === 0) {
+      res.status(400).json({
+        error: 'Spreadsheet berhasil dibuka, namun belum ada baris respon siswa yang terbaca.',
+      });
+      return;
+    }
+
+    exam.googleSheetUrl = rawSheetUrl;
+    if (providedKey.length > 0) {
+      exam.answerKey = providedKey;
+    }
+    exam.updatedAt = new Date().toISOString();
+
+    for (const row of parsed.rows) {
+      const itemScores: number[] = Array.isArray(row.itemScores)
+        ? row.itemScores.map((v) => (Number(v) > 0 ? 1 : 0))
+        : [];
+      const rawScore =
+        row.rawScore !== null && row.rawScore !== undefined
+          ? Number(row.rawScore)
+          : itemScores.reduce((acc, v) => acc + v, 0);
+
+      upsertStudentResult(exam, {
+        studentName: row.studentName,
+        absenNumber: row.absenNumber,
+        rawScore,
+        itemScores,
+        answers: row.answers,
+        submittedAt: row.submittedAt,
+        source: 'google_forms',
+      });
+    }
+
+    await saveState();
+    res.json({
+      exam,
+      exams: state.exams,
+      results: state.results.filter((r) => r.examId === exam.id),
+      syncedCount: parsed.rows.length,
+      detectedQuestions: parsed.detectedQuestions,
+      hasScoreColumn: parsed.hasScoreColumn,
+    });
+  });
+
+  // Real-time & batch Webhook for Google Form Apps Script (authenticated by per-exam webhookSecret)
   app.post('/api/webhook/form-response/:examId', async (req, res) => {
     const exam = state.exams.find((ex) => ex.id === req.params.examId);
     if (!exam) {
@@ -1040,24 +1271,91 @@ export function createApp() {
       return;
     }
 
+    if (Array.isArray(req.body?.answerKey) && req.body.answerKey.length > 0) {
+      exam.answerKey = req.body.answerKey.map((k: unknown) => String(k ?? '').trim()).slice(0, 100);
+      exam.updatedAt = new Date().toISOString();
+    }
+
+    const batchRows = Array.isArray(req.body?.batch) ? req.body.batch : null;
+    const hasExamKey = (exam.answerKey || []).some((k) => k.trim() !== '');
+    if (batchRows) {
+      let synced = 0;
+      for (const row of batchRows) {
+        const sName = String(row?.studentName ?? '').trim();
+        if (!sName) continue;
+        const sAbsen = String(row?.absenNumber ?? '').trim() || '-';
+        let itemScores = Array.isArray(row?.itemScores)
+          ? row.itemScores.map((v: unknown) => (Number(v) > 0 ? 1 : 0))
+          : [];
+        const answers = Array.isArray(row?.answers) ? row.answers.map(String) : undefined;
+        let rawScore =
+          row?.rawScore !== undefined && row?.rawScore !== null
+            ? Number(row.rawScore)
+            : itemScores.reduce((acc: number, v: number) => acc + v, 0);
+
+        if (
+          rawScore === 0 &&
+          !itemScores.some((v: number) => v > 0) &&
+          answers &&
+          answers.length > 0 &&
+          hasExamKey
+        ) {
+          const graded = gradeAnswersWithKey(answers, exam.answerKey, exam.questionCount || 40);
+          itemScores = graded.itemScores;
+          rawScore = graded.rawScore;
+        }
+
+        upsertStudentResult(exam, {
+          studentName: sName,
+          absenNumber: sAbsen,
+          rawScore,
+          itemScores,
+          answers,
+          submittedAt: Number(row?.submittedAt) || Date.now(),
+          source: 'google_forms',
+        });
+        synced++;
+      }
+      await saveState();
+      res.json({ ok: true, synced });
+      return;
+    }
+
     const studentName = String(req.body?.studentName ?? '').trim();
     const absenNumber = String(req.body?.absenNumber ?? '').trim();
     if (!studentName) {
+      if (Array.isArray(req.body?.answerKey)) {
+        await saveState();
+        res.json({ ok: true, answerKey: exam.answerKey });
+        return;
+      }
       res.status(400).json({ error: 'studentName wajib dikirim.' });
       return;
     }
 
-    const itemScores = Array.isArray(req.body?.itemScores)
+    let itemScores = Array.isArray(req.body?.itemScores)
       ? req.body.itemScores.map((v: unknown) => (Number(v) > 0 ? 1 : 0))
       : [];
     const answers = Array.isArray(req.body?.answers)
       ? req.body.answers.map(String)
       : undefined;
 
-    const rawScore =
+    let rawScore =
       req.body?.rawScore !== undefined && req.body?.rawScore !== null
         ? Number(req.body.rawScore)
         : itemScores.reduce((acc: number, v: number) => acc + v, 0);
+
+    if (
+      rawScore === 0 &&
+      !itemScores.some((v: number) => v > 0) &&
+      answers &&
+      answers.length > 0 &&
+      hasExamKey
+    ) {
+      const graded = gradeAnswersWithKey(answers, exam.answerKey, exam.questionCount || 40);
+      itemScores = graded.itemScores;
+      rawScore = graded.rawScore;
+    }
 
     const saved = upsertStudentResult(exam, {
       studentName,

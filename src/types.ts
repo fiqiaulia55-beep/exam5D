@@ -15,6 +15,7 @@ export interface ExamItem {
   teacherName: string;
   googleFormUrl: string;
   googleFormId?: string;
+  googleSheetUrl?: string;
   entryToken: string;
   submitToken: string;
   durationMinutes: number;
